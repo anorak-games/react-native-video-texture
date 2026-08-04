@@ -21,8 +21,7 @@
     "test": "vitest run",
     "prepare": "npm run clean && npm run build",
     "prepublishOnly": "npm test",
-    "patch:webgpu": "patch-package react-native-webgpu --exclude '(^|/)\\.cxx(/|$)|^android/build(/|$)|^package\\.json$'",
-    "release:minor": "npm version minor && npm publish --access public"
+    "patch:webgpu": "patch-package react-native-webgpu --exclude '(^|/)\\.cxx(/|$)|^android/build(/|$)|^package\\.json$'"
   },
   "keywords": [
     "expo",
