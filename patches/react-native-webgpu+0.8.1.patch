@@ -1,0 +1,28 @@
+diff --git a/node_modules/react-native-webgpu/cpp/rnwgpu/api/GPUExternalTexture.h b/node_modules/react-native-webgpu/cpp/rnwgpu/api/GPUExternalTexture.h
+index 917909e..c67ea00 100644
+--- a/node_modules/react-native-webgpu/cpp/rnwgpu/api/GPUExternalTexture.h
++++ b/node_modules/react-native-webgpu/cpp/rnwgpu/api/GPUExternalTexture.h
+@@ -63,13 +63,23 @@ public:
+       wgpu::SharedTextureMemoryEndAccessState state{};
+       (void)_memory.EndAccess(_texture, &state);
+     }
++    // Drop the wgpu::ExternalTexture too: it holds the plane texture *views*, so
++    // while it lives the imported texture cannot be freed and EndAccess above
++    // does not actually hand the surface back. Releasing _source in the same
++    // breath returns the producer's buffer (CVPixelBuffer / AHardwareBuffer)
++    // instead of waiting for the JS wrapper to be garbage-collected.
++    _instance = nullptr;
+     _texture = nullptr;
+     _memory = nullptr;
++    _source = nullptr;
+   }
+ 
+   std::string getLabel() { return _label; }
+   void setLabel(const std::string &label) {
+     _label = label;
++    if (_instance == nullptr) {
++      return; // destroyed; keep the label for getLabel() but skip the native call
++    }
+     _instance.SetLabel(_label.c_str());
+   }
+ 

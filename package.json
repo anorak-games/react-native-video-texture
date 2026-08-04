@@ -1,0 +1,65 @@
+{
+  "name": "@anorak-games/react-native-video-texture",
+  "version": "0.1.0",
+  "description": "Headless Expo video player that exposes decoded frames as WebGPU-compatible native textures.",
+  "main": "build/index.js",
+  "types": "build/index.d.ts",
+  "files": [
+    "android",
+    "build",
+    "cpp",
+    "ios",
+    "patches",
+    "expo-module.config.json",
+    "ReactNativeVideoTexture.podspec",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rimraf build coverage",
+    "test": "vitest run",
+    "prepare": "npm run clean && npm run build",
+    "prepublishOnly": "npm test",
+    "patch:webgpu": "patch-package react-native-webgpu --exclude '(^|/)\\.cxx(/|$)|^android/build(/|$)|^package\\.json$'",
+    "release:minor": "npm version minor && npm publish --access public"
+  },
+  "keywords": [
+    "expo",
+    "react-native",
+    "video",
+    "webgpu",
+    "texture"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anorak-games/react-native-video-texture.git"
+  },
+  "bugs": {
+    "url": "https://github.com/anorak-games/react-native-video-texture/issues"
+  },
+  "homepage": "https://github.com/anorak-games/react-native-video-texture#readme",
+  "author": "Anorak Games",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "peerDependencies": {
+    "expo": ">=56.0.0",
+    "react": "*",
+    "react-native": "*",
+    "react-native-webgpu": "0.8.1"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.0",
+    "expo": "~56.0.18",
+    "patch-package": "8.0.1",
+    "react": "19.2.3",
+    "react-native": "0.85.3",
+    "react-native-webgpu": "0.8.1",
+    "rimraf": "^6.1.2",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}

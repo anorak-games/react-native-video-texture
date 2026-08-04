@@ -1,0 +1,50 @@
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.iml
+
+# Node and npm
+node_modules/
+*.tgz
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TypeScript and tests
+build/
+coverage/
+*.tsbuildinfo
+
+# Expo
+.expo/
+
+# CocoaPods and Xcode
+Pods/
+DerivedData/
+ios/build/
+*.hmap
+*.ipa
+*.mode1v3
+*.mode2v3
+*.pbxuser
+*.perspectivev3
+*.xcuserstate
+*.xccheckout
+*.moved-aside
+xcuserdata/
+project.xcworkspace/
+
+# Gradle, CMake, and Android Studio
+.cxx/
+.gradle/
+android/.cxx/
+android/.gradle/
+android/build/
+android/local.properties
+local.properties
+.classpath
+.project
+.settings/

@@ -1,0 +1,10 @@
+{
+  "platforms": ["ios", "android"],
+  "ios": {
+    "podspecPath": "ReactNativeVideoTexture.podspec",
+    "modules": ["VideoTextureModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.videotexture.VideoTextureModule"]
+  }
+}

@@ -1,0 +1,54 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+def packageJson = new groovy.json.JsonSlurper().parseText(file('../package.json').text)
+
+group = 'expo.modules.videotexture'
+version = packageJson.version
+
+def reactNativeArchitectures() {
+  def value = rootProject.getProperties().get("reactNativeArchitectures")
+  return value ? value.split(",") : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
+}
+
+android {
+  namespace "expo.modules.videotexture"
+  defaultConfig {
+    minSdkVersion 29
+    versionCode 1
+    versionName packageJson.version
+    externalNativeBuild {
+      cmake {
+        abiFilters (*reactNativeArchitectures())
+        arguments '-DANDROID_STL=c++_shared'
+      }
+    }
+  }
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+    }
+  }
+  buildFeatures {
+    prefab true
+  }
+  packagingOptions {
+    excludes += [
+      "**/libc++_shared.so",
+      "**/libjsi.so",
+      "**/libfbjni.so",
+      "**/libreactnative.so",
+    ]
+  }
+}
+
+dependencies {
+  implementation 'com.facebook.react:react-android'
+
+  def media3Version = "1.8.0"
+  implementation "androidx.media3:media3-exoplayer:$media3Version"
+  implementation "androidx.media3:media3-common:$media3Version"
+  implementation "androidx.media3:media3-datasource:$media3Version"
+}
