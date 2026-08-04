@@ -108,10 +108,6 @@ npm run patch:webgpu
 
 ## Releasing
 
-```sh
-npm login
-npm run release:minor
-```
+Merge to main, then create a Github Release with appropriate version tag (ie v0.4.0), Github Action will publish from that.
 
-If publishing fails after the version was bumped, fix the publishing issue and run
-`npm publish --access public`; do not bump the version a second time.
+Manual release via `npm release:minor` if you have credentials, but you should prefer the github flow.
