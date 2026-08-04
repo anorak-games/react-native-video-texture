@@ -27,8 +27,8 @@ Mirrors `ios/` behavior with Android-native plumbing. Same TS contract (`src/Vid
 - **Requirements** — a physical device, API 29+ (`ImageReader` usage-flags overload);
   `pixelFormat` must be `'nv12'` (Android decoders yield YCbCr AHardwareBuffers; no BGRA
   path). Rotated video is rejected at load.
-- **WebGPU side** — the app must request `dawn-multi-planar-formats`, `ycbcr-vulkan-samplers`,
-  and `opaque-ycbcr-android-for-external-texture` in `requestDevice`, and its shader must apply
+- **WebGPU side** — the app must request `ycbcr-vulkan-samplers` and
+  `opaque-ycbcr-android-for-external-texture` in `requestDevice`, and its shader must apply
   `GPUExternalTexture.yuvToRgbMatrix` after sampling. Dawn imports YUV AHardwareBuffers as
   `OpaqueYCbCrAndroid` and samples them through a Vulkan conversion hard-coded to
   `RGB_IDENTITY`, so the sample arrives as raw `[Y, Cb, Cr]` and the model conversion is the

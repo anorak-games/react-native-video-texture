@@ -1,12 +1,10 @@
 import { Platform } from 'expo-modules-core';
 
 const FEATURES_BY_PLATFORM: Record<string, readonly string[]> = {
+    // IOSurface NV12 imports expose separate luma and chroma planes.
     ios: ['dawn-multi-planar-formats'],
-    android: [
-        'dawn-multi-planar-formats',
-        'ycbcr-vulkan-samplers',
-        'opaque-ycbcr-android-for-external-texture',
-    ],
+    // AHardwareBuffer YUV imports use Dawn's single opaque-YCbCr texture path.
+    android: ['ycbcr-vulkan-samplers', 'opaque-ycbcr-android-for-external-texture'],
 };
 
 /**
