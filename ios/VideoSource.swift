@@ -53,6 +53,18 @@ final class VideoSource: NSObject {
   /// The loop mode the current player was configured with. The same-URI reuse path must not
   /// keep a player whose shape (single item vs looper) no longer matches the requested mode.
   private var installedLoopMode = "off"
+  /// Looper retired by a loop→'off' conversion, parked here until teardown. An
+  /// `AVPlayerLooper` REMOVES its looped items from the player when it deallocates —
+  /// releasing it mid-conversion yanks the still-playing current item out of the queue,
+  /// the armed follow-up seek then has no item to land on, and the frame gate freezes the
+  /// renderer on its last texture.
+  private var retiredLooper: AVPlayerLooper?
+  /// The [start, end] region the current looper was built over (whole file = (0, -1)).
+  /// An `AVPlayerLooper`'s timeRange is immutable, so a loop-region change — unlike an
+  /// 'off'-mode region change, which is just a forwardPlaybackEndTime write + seek — needs
+  /// a fresh player.
+  private var installedLoopStartSec: Double = 0
+  private var installedLoopEndSec: Double = -1
 
   /// On-demand live time (one `player.currentTime()` query — a synchronous XPC to mediaserverd,
   /// so NEVER call this per-frame on the main thread; see `copyPixelBuffer` / the time observer).
@@ -111,6 +123,27 @@ final class VideoSource: NSObject {
   /// re-arm from redundant same-URI `loadUri` calls that must not move the playhead.
   private var pendingReuseStartSec: Double?
   private var lastPlaybackStartTime: CFTimeInterval = 0
+  /// Absolute-file-time bound of the playable region; <= 0 = none. In `'off'` mode it is
+  /// applied as `forwardPlaybackEndTime` (so `AVPlayerItemDidPlayToEndTime` fires there);
+  /// in `'loop'` mode it becomes the looper's timeRange end.
+  private var clipEndSec: Double = -1
+
+  /// Armed together with `armClipStart` (once per clip generation), before `loadUri`.
+  func armClipEnd(sec: Double) {
+    clipEndSec = sec > 0 ? sec : -1
+  }
+
+  /// `forwardPlaybackEndTime` value for the armed region (`.invalid` clears the bound).
+  private var clipEndTime: CMTime {
+    clipEndSec > 0 ? CMTime(seconds: clipEndSec, preferredTimescale: 600) : .invalid
+  }
+
+  /// The effective end of the playable region (item duration, or the armed region bound).
+  private func effectiveEndSec(of item: AVPlayerItem?) -> Double {
+    let duration = item?.duration.seconds ?? 0
+    guard duration.isFinite, duration > 0 else { return clipEndSec > 0 ? clipEndSec : 0 }
+    return clipEndSec > 0 ? min(duration, clipEndSec) : duration
+  }
 
   func setShouldAutoPlay(_ value: Bool) {
     shouldAutoPlay = value
@@ -141,11 +174,21 @@ final class VideoSource: NSObject {
       delegate?.videoSource(self, didChangeStatus: "idle")
       return
     }
-    // Same URI + player alive: skip teardown+reload. (Guarded on the installed loop mode:
-    // a mode change needs a fresh player shape — single item vs looper.)
-    if uri == currentUri, player != nil, loopMode == installedLoopMode {
+    // Same URI + player alive + same mode: skip teardown+reload. Mode changes: loop→'off'
+    // is converted in place by the branch below; 'off'→loop and loop-region changes (a
+    // looper's timeRange is immutable) still fall through to a fresh install.
+    let loopRegionUnchanged =
+      loopMode != "loop"
+      || (abs(installedLoopStartSec - max(0, clipStartSec)) < 0.001
+        && abs(installedLoopEndSec - clipEndSec) < 0.001)
+    if uri == currentUri, player != nil, loopMode == installedLoopMode, loopRegionUnchanged {
       // A new playback may reuse the same file; reset end-of-clip heuristics before seeking.
       lastPlaybackStartTime = CACurrentMediaTime()
+      // A region change in 'off' mode is just a bound rewrite on the live item — THE hot
+      // path for a baked-file segment swap (main → follow-up is a seek, not a teardown).
+      if loopMode != "loop" {
+        player?.currentItem?.forwardPlaybackEndTime = clipEndTime
+      }
       // Apply a freshly-armed clip start HERE, as a real seek — 0 included. `armClipStart` only
       // records; for start==0 it also clears the pending position, which is right for a fresh
       // item (it begins at 0) but wrong on reuse: the player is parked wherever the previous
@@ -154,6 +197,28 @@ final class VideoSource: NSObject {
       // a play and the clip soft-locked on its last frame — no new decoded frames, so the
       // render loop froze too. `applyDeferredSeekIfReady` resumes via `startPlaybackPrerolled`.
       // Guarded so redundant same-URI loads do not move the playhead.
+      if let start = pendingReuseStartSec {
+        pendingReuseStartSec = nil
+        armDeferredSeek(start)
+        applyDeferredSeekIfReady()
+      }
+      return
+    }
+    // Same URI, looper installed, 'off' requested: convert the live looper into a bounded
+    // single playback instead of tearing down — THE shot-time swap on a looping level
+    // (main loop → follow-up region). The looper's cycled item is a copy of the FULL asset
+    // (its timeRange only bounds playback), so dropping the loop machinery, rewriting the
+    // region bound, and seeking reaches any part of the file with no decoder respin.
+    // A false return is NOT a degraded retry: it means there is no live item to convert
+    // (the looper fills its queue asynchronously, so a shot in a round's first frames can
+    // beat it) — the fresh-install path below is the primary path for that state.
+    if uri == currentUri, installedLoopMode == "loop", loopMode == "off",
+      convertLooperToBoundedSinglePlayback()
+    {
+      installedLoopMode = "off"
+      installedLoopStartSec = 0
+      installedLoopEndSec = -1
+      lastPlaybackStartTime = CACurrentMediaTime()
       if let start = pendingReuseStartSec {
         pendingReuseStartSec = nil
         armDeferredSeek(start)
@@ -185,12 +250,17 @@ final class VideoSource: NSObject {
 
     installedLoopMode = loopMode
     if loopMode == "loop" {
+      installedLoopStartSec = max(0, clipStartSec)
+      installedLoopEndSec = clipEndSec
       installLooper(url: url)
       return
     }
 
     let asset = AVURLAsset(url: url)
     let item = AVPlayerItem(asset: asset)
+    // Bound the playable region: AVPlayerItemDidPlayToEndTime fires at this time natively,
+    // so the existing end observer covers region ends with no extra machinery.
+    item.forwardPlaybackEndTime = clipEndTime
     #if targetEnvironment(simulator)
     let output = AVPlayerItemVideoOutput(outputSettings: nil)
     #else
@@ -213,12 +283,31 @@ final class VideoSource: NSObject {
     self.player = avPlayer
     startFramePull()
 
-    // Monitor for unexpected stalls / pauses.
-    // Handles two cases:
-    // 1. AVPlayer fails to fire AVPlayerItemDidPlayToEndTime after certain seek patterns
-    //    → detect a near-end pause and report the end
-    // 2. iOS pauses the player mid-clip (audio session, decoder scheduling)
-    //    → resume after brief delay
+    installOffModeTimeControlObserver(on: avPlayer)
+
+    delegate?.videoSource(self, didChangeStatus: "loading")
+
+    item.addObserver(self, forKeyPath: "status", options: [.new], context: nil)
+    statusObservedItem = item
+
+    endObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemDidPlayToEndTime,
+      object: item,
+      queue: .main
+    ) { [weak self] note in
+      self?.handleItemDidPlayToEnd(note)
+    }
+  }
+
+  /// `'off'`-mode watchdog: monitor for unexpected stalls / pauses. Installed by a fresh
+  /// 'off' load AND by the looper→'off' conversion in `loadUri` (replacing the loop
+  /// watchdog, whose blind rate-nudge would fight the region-end pause). Handles two cases:
+  /// 1. AVPlayer fails to fire AVPlayerItemDidPlayToEndTime after certain seek patterns
+  ///    → detect a near-end pause and report the end
+  /// 2. iOS pauses the player mid-clip (audio session, decoder scheduling)
+  ///    → resume after brief delay
+  private func installOffModeTimeControlObserver(on avPlayer: AVPlayer) {
+    timeControlObserver?.invalidate()
     timeControlObserver = avPlayer.observe(\.timeControlStatus, options: [.new, .old]) { [weak self] player, _ in
       guard let self, player === self.player else { return }
       let status = player.timeControlStatus
@@ -229,7 +318,10 @@ final class VideoSource: NSObject {
         }
         let playElapsed = CACurrentMediaTime() - self.lastPlaybackStartTime
         let currentSec = player.currentTime().seconds
-        let durationSec = player.currentItem?.duration.seconds ?? 0
+        // The region bound (forwardPlaybackEndTime) is the real end when set: measuring
+        // against the full item duration would misread the region-end pause as a mid-clip
+        // stall and resume playback PAST the region.
+        let durationSec = self.effectiveEndSec(of: player.currentItem)
         let nearEnd = durationSec > 0.2 && (durationSec - currentSec) < 0.5
 
         if nearEnd && playElapsed >= 1.5 {
@@ -244,19 +336,56 @@ final class VideoSource: NSObject {
         }
       }
     }
+  }
 
-    delegate?.videoSource(self, didChangeStatus: "loading")
-
-    item.addObserver(self, forKeyPath: "status", options: [.new], context: nil)
-    statusObservedItem = item
-
-    endObserver = NotificationCenter.default.addObserver(
-      forName: .AVPlayerItemDidPlayToEndTime,
-      object: item,
-      queue: .main
-    ) { [weak self] note in
-      self?.handleItemDidPlayToEnd(note)
+  /// Convert the live looper into a bounded single playback on the SAME player — the
+  /// teardown-free path for a same-URI loop→'off' clip swap. Returns false when there is
+  /// nothing usable to convert (no queue player, no current item, or the manipulation lost
+  /// the current item); the caller then falls back to a full teardown + fresh install.
+  private func convertLooperToBoundedSinglePlayback() -> Bool {
+    guard let queue = player as? AVQueuePlayer, let current = queue.currentItem else {
+      return false
     }
+    looper?.disableLooping()
+    // Park the looper (see `retiredLooper`): releasing it here would dealloc it and rip
+    // `current` out of the queue while it is still the item being played and pulled from.
+    retiredLooper = looper
+    looper = nil
+    looperStatusObserver?.invalidate()
+    looperStatusObserver = nil
+    // No more looper-driven item advances: stop re-attaching outputs per cycle, and drop
+    // the queued copies so the region end pauses here instead of advancing into another
+    // cycle of the old loop.
+    currentItemObserver?.invalidate()
+    currentItemObserver = nil
+    for item in queue.items() where item !== current {
+      queue.remove(item)
+    }
+    queue.actionAtItemEnd = .pause
+    current.forwardPlaybackEndTime = clipEndTime
+    // 'off' semantics from here on: report 'ended' at the region bound (loop mode installs
+    // no end observer), and swap the loop watchdog for the off-mode observer — the loop
+    // variant has no near-end guard, so it would misread the region-end pause as a stall
+    // and kick the rate back up against the bound.
+    if endObserver == nil {
+      endObserver = NotificationCenter.default.addObserver(
+        forName: .AVPlayerItemDidPlayToEndTime,
+        object: current,
+        queue: .main
+      ) { [weak self] note in
+        self?.handleItemDidPlayToEnd(note)
+      }
+    }
+    installOffModeTimeControlObserver(on: queue)
+    // Documented AVFoundation behavior guarantees the current item survives all of the
+    // above (disableLooping lets the current pass play out; removing OTHER queue items
+    // cannot change currentItem). If that contract ever breaks, fail LOUDLY in debug —
+    // a silent fall-through here would mean quietly tearing down on every shot, hiding
+    // the exact regression this path exists to prevent.
+    assert(
+      queue.currentItem === current,
+      "loop→off conversion lost the current item — AVPlayerLooper broke its contract")
+    return queue.currentItem === current
   }
 
   /// Install an `AVQueuePlayer` + `AVPlayerLooper` for seamless looping of `url`, at load
@@ -322,8 +451,19 @@ final class VideoSource: NSObject {
     }
 
     // Installing the looper populates the queue (copies of the template) and loops them
-    // gaplessly; actionAtItemEnd is managed by the looper from here on.
-    let looper = AVPlayerLooper(player: queue, templateItem: template)
+    // gaplessly; actionAtItemEnd is managed by the looper from here on. With an armed
+    // region the looper cycles ONLY [startSec, endSec] of the asset — cycled copies report
+    // asset-absolute item time, so ptsSec sawtooths startSec→endSec with no translation.
+    let looper: AVPlayerLooper
+    if clipEndSec > 0 {
+      let start = max(0, clipStartSec)
+      let range = CMTimeRange(
+        start: CMTime(seconds: start, preferredTimescale: 600),
+        duration: CMTime(seconds: max(0, clipEndSec - start), preferredTimescale: 600))
+      looper = AVPlayerLooper(player: queue, templateItem: template, timeRange: range)
+    } else {
+      looper = AVPlayerLooper(player: queue, templateItem: template)
+    }
     self.looper = looper
     looperStatusObserver = looper.observe(\.status, options: [.new]) { [weak self] looper, _ in
       guard let self else { return }
@@ -453,7 +593,7 @@ final class VideoSource: NSObject {
   }
 
   func seek(to sec: Double) {
-    let duration = player?.currentItem?.duration.seconds ?? 0
+    let duration = effectiveEndSec(of: player?.currentItem)
     let clampedSec = (duration > 0.2) ? min(sec, duration - 0.1) : sec
     armDeferredSeek(max(0, clampedSec))
     applyDeferredSeekIfReady()
@@ -692,6 +832,8 @@ final class VideoSource: NSObject {
     // Tear down the gapless looper + its current-item KVO before dropping the player.
     looper?.disableLooping()
     looper = nil
+    // Safe to release now: its dealloc-time item removal hits a player we are discarding.
+    retiredLooper = nil
     looperStatusObserver?.invalidate()
     looperStatusObserver = nil
     currentItemObserver?.invalidate()

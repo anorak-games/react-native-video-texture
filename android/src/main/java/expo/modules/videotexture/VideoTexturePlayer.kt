@@ -75,6 +75,7 @@ class VideoTexturePlayer(
     if (options.generation != appliedGeneration) {
       appliedGeneration = options.generation
       videoSource.setClipGeneration(options.generation.toLong())
+      videoSource.armClipEnd(options.endSec)
       videoSource.armClipStart(options.startSec)
     }
     videoSource.loadUri(options.uri)
@@ -122,6 +123,7 @@ class VideoTexturePlayer(
   fun dispatchLoadClipFromNative(
     uri: String,
     startSec: Double,
+    endSec: Double,
     generation: Int,
     loopMode: String,
     autoPlay: Boolean,
@@ -129,6 +131,7 @@ class VideoTexturePlayer(
     loadClip(LoadClipOptions().apply {
       this.uri = uri
       this.startSec = startSec
+      this.endSec = endSec
       this.generation = generation
       this.loopMode = loopMode
       this.autoPlay = autoPlay

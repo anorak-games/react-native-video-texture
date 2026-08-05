@@ -27,7 +27,7 @@ void AndroidFrameProvider::attachCommandTarget(JNIEnv *env, jobject target) {
   commandTarget_ = env->NewGlobalRef(target);
   jclass cls = env->GetObjectClass(target);
   loadClipMethod_ = env->GetMethodID(cls, "dispatchLoadClipFromNative",
-                                     "(Ljava/lang/String;DILjava/lang/String;Z)V");
+                                     "(Ljava/lang/String;DDILjava/lang/String;Z)V");
   setPausedMethod_ = env->GetMethodID(cls, "dispatchSetPausedFromNative", "(Z)V");
   setRateMethod_ = env->GetMethodID(cls, "dispatchSetRateFromNative", "(D)V");
   rampRateMethod_ = env->GetMethodID(cls, "dispatchRampRateFromNative", "(DD)V");
@@ -141,14 +141,15 @@ TransportSnapshot AndroidFrameProvider::transportSnapshot() {
   return transport_;
 }
 
-void AndroidFrameProvider::loadClip(const std::string &uri, double startSec, int64_t generation,
-                                    const std::string &loopMode, bool autoPlay) {
+void AndroidFrameProvider::loadClip(const std::string &uri, double startSec, double endSec,
+                                    int64_t generation, const std::string &loopMode,
+                                    bool autoPlay) {
   withEnv(jvm_, [&](JNIEnv *env) {
     std::lock_guard<std::mutex> lock(commandMutex_);
     if (!commandTarget_ || !loadClipMethod_) return;
     jstring jUri = env->NewStringUTF(uri.c_str());
     jstring jLoopMode = env->NewStringUTF(loopMode.c_str());
-    env->CallVoidMethod(commandTarget_, loadClipMethod_, jUri, startSec,
+    env->CallVoidMethod(commandTarget_, loadClipMethod_, jUri, startSec, endSec,
                         static_cast<jint>(generation), jLoopMode, static_cast<jboolean>(autoPlay));
     env->DeleteLocalRef(jUri);
     env->DeleteLocalRef(jLoopMode);

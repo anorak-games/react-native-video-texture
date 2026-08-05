@@ -39,6 +39,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (VideoTextureTransportSnapshot *)transportSnapshot;
 - (void)loadClipWithUri:(NSString *)uri
                startSec:(double)startSec
+                 endSec:(double)endSec
              generation:(int64_t)generation
                loopMode:(NSString *)loopMode
                autoPlay:(BOOL)autoPlay;

@@ -43,8 +43,10 @@ class FrameProvider {
   virtual ~FrameProvider() = default;
   virtual AcquiredFrame copyNewFrame() = 0;  // +1, or handle == nullptr when nothing new
   virtual TransportSnapshot transportSnapshot() = 0;
-  virtual void loadClip(const std::string &uri, double startSec, int64_t generation,
-                        const std::string &loopMode, bool autoPlay) = 0;
+  /// endSec bounds the playable region in ABSOLUTE file seconds (<= 0 = no bound):
+  /// 'off' reports ended there; 'loop' loops [startSec, endSec].
+  virtual void loadClip(const std::string &uri, double startSec, double endSec,
+                        int64_t generation, const std::string &loopMode, bool autoPlay) = 0;
   virtual void setPaused(bool paused) = 0;
   virtual void setRate(double rate) = 0;
   virtual void rampRate(double rate, double durationMs) = 0;

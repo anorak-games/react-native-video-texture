@@ -6,6 +6,8 @@ import ExpoModulesCore
 struct LoadClipOptions: Record {
   @Field var uri: String = ""
   @Field var startSec: Double = 0
+  /// Absolute-file-time playable-region bound; <= 0 = none (whole file).
+  @Field var endSec: Double = -1
   @Field var generation: Int = 0
   @Field var loopMode: String = "off"
   @Field var autoPlay: Bool = true
@@ -64,6 +66,7 @@ public final class VideoTexturePlayer: SharedObject, VideoSourceDelegate {
       // Stamp every frame deposited from here on, so the render loop can tell a clip swap
       // from a seek without inferring it from a media-time discontinuity.
       videoSource.setClipGeneration(Int64(options.generation))
+      videoSource.armClipEnd(sec: options.endSec)
       videoSource.armClipStart(sec: options.startSec)
     }
     videoSource.loadUri(options.uri)
@@ -207,13 +210,15 @@ final class FrameProviderAdapter: NSObject, VideoTextureFrameProviding {
   }
 
   func loadClip(
-    withUri uri: String, startSec: Double, generation: Int64, loopMode: String, autoPlay: Bool
+    withUri uri: String, startSec: Double, endSec: Double, generation: Int64, loopMode: String,
+    autoPlay: Bool
   ) {
     DispatchQueue.main.async { [weak commandTarget] in
       guard let commandTarget else { return }
       let options = LoadClipOptions()
       options.uri = uri
       options.startSec = startSec
+      options.endSec = endSec
       options.generation = Int(generation)
       options.loopMode = loopMode
       options.autoPlay = autoPlay
