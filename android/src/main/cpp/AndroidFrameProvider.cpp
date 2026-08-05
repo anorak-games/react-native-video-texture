@@ -1,5 +1,7 @@
 #include "AndroidFrameProvider.h"
 
+#include <android/log.h>
+
 namespace videotexture {
 
 AndroidFrameProvider::AndroidFrameProvider(std::string pixelFormat)
@@ -30,6 +32,7 @@ void AndroidFrameProvider::attachCommandTarget(JNIEnv *env, jobject target) {
   setRateMethod_ = env->GetMethodID(cls, "dispatchSetRateFromNative", "(D)V");
   rampRateMethod_ = env->GetMethodID(cls, "dispatchRampRateFromNative", "(DD)V");
   setVolumeMethod_ = env->GetMethodID(cls, "dispatchSetVolumeFromNative", "(D)V");
+  releaseFrameMethod_ = env->GetMethodID(cls, "dispatchReleaseFrameFromNative", "(J)V");
   env->DeleteLocalRef(cls);
 }
 
@@ -44,6 +47,7 @@ void AndroidFrameProvider::detachCommandTarget(JNIEnv *env) {
   setRateMethod_ = nullptr;
   rampRateMethod_ = nullptr;
   setVolumeMethod_ = nullptr;
+  releaseFrameMethod_ = nullptr;
 }
 
 namespace {
@@ -59,30 +63,52 @@ void withEnv(JavaVM *jvm, Call call) {
 }
 }  // namespace
 
-void AndroidFrameProvider::pushFrame(AHardwareBuffer *buffer, double ptsSec, int64_t generation) {
+uint64_t AndroidFrameProvider::pushFrame(AHardwareBuffer *buffer, double ptsSec,
+                                         int64_t generation) {
   if (!buffer) {
-    return;
+    return 0;
   }
   AHardwareBuffer_acquire(buffer);
 
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (latest_) {
-    AHardwareBuffer_release(latest_);
+  AHardwareBuffer *unconsumed = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!loggedBufferDescription_) {
+      AHardwareBuffer_Desc desc{};
+      AHardwareBuffer_describe(buffer, &desc);
+      __android_log_print(
+          ANDROID_LOG_WARN, "VideoTextureColor",
+          "AHardwareBuffer width=%u height=%u layers=%u format=0x%x usage=0x%llx stride=%u",
+          desc.width, desc.height, desc.layers, desc.format,
+          static_cast<unsigned long long>(desc.usage), desc.stride);
+      loggedBufferDescription_ = true;
+    }
+    if (latest_) {
+      if (latestIsNew_) unconsumed = latest_;
+      AHardwareBuffer_release(latest_);
+    }
+    latest_ = buffer;
+    latestIsNew_ = true;
+    latestPtsSec_ = ptsSec;
+    latestGeneration_ = generation;
   }
-  latest_ = buffer;
-  latestIsNew_ = true;
-  latestPtsSec_ = ptsSec;
-  latestGeneration_ = generation;
+  if (unconsumed) releaseImage(unconsumed);
+  return reinterpret_cast<uint64_t>(buffer);
 }
 
 void AndroidFrameProvider::clearLatest() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (latest_) {
-    AHardwareBuffer_release(latest_);
-    latest_ = nullptr;
+  AHardwareBuffer *unconsumed = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (latest_) {
+      if (latestIsNew_) unconsumed = latest_;
+      AHardwareBuffer_release(latest_);
+      latest_ = nullptr;
+    }
+    latestIsNew_ = false;
+    latestPtsSec_ = -1.0;
   }
-  latestIsNew_ = false;
-  latestPtsSec_ = -1.0;
+  if (unconsumed) releaseImage(unconsumed);
 }
 
 void AndroidFrameProvider::updateTransport(std::string uri, int status, int64_t statusSeq,
@@ -161,7 +187,27 @@ void AndroidFrameProvider::setVolume(double volume) {
 }
 
 void AndroidFrameProvider::releaseHandle(void *handle) {
+  releaseImage(static_cast<AHardwareBuffer *>(handle));
   AHardwareBuffer_release(static_cast<AHardwareBuffer *>(handle));
+}
+
+void AndroidFrameProvider::releaseImage(AHardwareBuffer *buffer) {
+  withEnv(jvm_, [&](JNIEnv *env) {
+    jobject target = nullptr;
+    jmethodID method = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(commandMutex_);
+      if (commandTarget_ && releaseFrameMethod_) {
+        target = env->NewGlobalRef(commandTarget_);
+        method = releaseFrameMethod_;
+      }
+    }
+    if (target) {
+      env->CallVoidMethod(target, method,
+                          static_cast<jlong>(reinterpret_cast<uint64_t>(buffer)));
+      env->DeleteGlobalRef(target);
+    }
+  });
 }
 
 std::string AndroidFrameProvider::pixelFormat() {

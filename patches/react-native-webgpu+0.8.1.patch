@@ -1,3 +1,222 @@
+diff --git a/node_modules/react-native-webgpu/cpp/jsi/NativeObject.h b/node_modules/react-native-webgpu/cpp/jsi/NativeObject.h
+index 7ed284d..fd4c273 100644
+--- a/node_modules/react-native-webgpu/cpp/jsi/NativeObject.h
++++ b/node_modules/react-native-webgpu/cpp/jsi/NativeObject.h
+@@ -499,11 +499,22 @@ protected:
+                             ReturnType (Derived::*method)(Args...)) {
+     auto func = jsi::Function::createFromHostFunction(
+         runtime, jsi::PropNameID::forUtf8(runtime, name), sizeof...(Args),
+-        [method](jsi::Runtime &rt, const jsi::Value &thisVal,
+-                 const jsi::Value *args, size_t count) -> jsi::Value {
+-          auto native = Derived::fromValue(rt, thisVal);
+-          return callMethod(native.get(), method, rt, args,
+-                            std::index_sequence_for<Args...>{}, count);
++        [method, name](jsi::Runtime &rt, const jsi::Value &thisVal,
++                       const jsi::Value *args, size_t count) -> jsi::Value {
++          // Rethrow native failures as jsi::JSError: its typeinfo is shared
++          // with the JS engine via libjsi, so the message survives the
++          // library boundary. A raw std::exception thrown across it can fail
++          // RTTI matching inside Hermes and surface as
++          // "Exception in HostFunction: <unknown>".
++          try {
++            auto native = Derived::fromValue(rt, thisVal);
++            return callMethod(native.get(), method, rt, args,
++                              std::index_sequence_for<Args...>{}, count);
++          } catch (const jsi::JSError &) {
++            throw;
++          } catch (const std::exception &e) {
++            throw jsi::JSError(rt, std::string(name) + ": " + e.what());
++          }
+         });
+     prototype.setProperty(runtime, name, func);
+   }
+@@ -521,12 +532,20 @@ protected:
+                                                          Args...)) {
+     auto func = jsi::Function::createFromHostFunction(
+         runtime, jsi::PropNameID::forUtf8(runtime, name), sizeof...(Args),
+-        [method](jsi::Runtime &rt, const jsi::Value &thisVal,
+-                 const jsi::Value *args, size_t count) -> jsi::Value {
+-          auto native = Derived::fromValue(rt, thisVal);
+-          return callMethodWithRuntime(native.get(), method, rt, args,
+-                                       std::index_sequence_for<Args...>{},
+-                                       count);
++        [method, name](jsi::Runtime &rt, const jsi::Value &thisVal,
++                       const jsi::Value *args, size_t count) -> jsi::Value {
++          // See installMethod: keep native error messages across the JSI
++          // boundary by rethrowing as jsi::JSError.
++          try {
++            auto native = Derived::fromValue(rt, thisVal);
++            return callMethodWithRuntime(native.get(), method, rt, args,
++                                         std::index_sequence_for<Args...>{},
++                                         count);
++          } catch (const jsi::JSError &) {
++            throw;
++          } catch (const std::exception &e) {
++            throw jsi::JSError(rt, std::string(name) + ": " + e.what());
++          }
+         });
+     prototype.setProperty(runtime, name, func);
+   }
+@@ -541,16 +560,24 @@ protected:
+     auto getterFunc = jsi::Function::createFromHostFunction(
+         runtime, jsi::PropNameID::forUtf8(runtime, std::string("get_") + name),
+         0,
+-        [getter](jsi::Runtime &rt, const jsi::Value &thisVal,
+-                 const jsi::Value *args, size_t count) -> jsi::Value {
+-          auto native = Derived::fromValue(rt, thisVal);
+-          if constexpr (std::is_same_v<ReturnType, void>) {
+-            (native.get()->*getter)();
+-            return jsi::Value::undefined();
+-          } else {
+-            ReturnType result = (native.get()->*getter)();
+-            return rnwgpu::JSIConverter<std::decay_t<ReturnType>>::toJSI(
+-                rt, std::move(result));
++        [getter, name](jsi::Runtime &rt, const jsi::Value &thisVal,
++                       const jsi::Value *args, size_t count) -> jsi::Value {
++          // See installMethod: keep native error messages across the JSI
++          // boundary by rethrowing as jsi::JSError.
++          try {
++            auto native = Derived::fromValue(rt, thisVal);
++            if constexpr (std::is_same_v<ReturnType, void>) {
++              (native.get()->*getter)();
++              return jsi::Value::undefined();
++            } else {
++              ReturnType result = (native.get()->*getter)();
++              return rnwgpu::JSIConverter<std::decay_t<ReturnType>>::toJSI(
++                  rt, std::move(result));
++            }
++          } catch (const jsi::JSError &) {
++            throw;
++          } catch (const std::exception &e) {
++            throw jsi::JSError(rt, std::string(name) + ": " + e.what());
+           }
+         });
+ 
+@@ -628,27 +655,41 @@ protected:
+     auto getterFunc = jsi::Function::createFromHostFunction(
+         runtime, jsi::PropNameID::forUtf8(runtime, std::string("get_") + name),
+         0,
+-        [getter](jsi::Runtime &rt, const jsi::Value &thisVal,
+-                 const jsi::Value *args, size_t count) -> jsi::Value {
+-          auto native = Derived::fromValue(rt, thisVal);
+-          ReturnType result = (native.get()->*getter)();
+-          return rnwgpu::JSIConverter<std::decay_t<ReturnType>>::toJSI(rt,
+-                                                               std::move(result));
++        [getter, name](jsi::Runtime &rt, const jsi::Value &thisVal,
++                       const jsi::Value *args, size_t count) -> jsi::Value {
++          // See installMethod: keep native error messages across the JSI
++          // boundary by rethrowing as jsi::JSError.
++          try {
++            auto native = Derived::fromValue(rt, thisVal);
++            ReturnType result = (native.get()->*getter)();
++            return rnwgpu::JSIConverter<std::decay_t<ReturnType>>::toJSI(rt,
++                                                                 std::move(result));
++          } catch (const jsi::JSError &) {
++            throw;
++          } catch (const std::exception &e) {
++            throw jsi::JSError(rt, std::string(name) + ": " + e.what());
++          }
+         });
+ 
+     auto setterFunc = jsi::Function::createFromHostFunction(
+         runtime, jsi::PropNameID::forUtf8(runtime, std::string("set_") + name),
+         1,
+-        [setter](jsi::Runtime &rt, const jsi::Value &thisVal,
+-                 const jsi::Value *args, size_t count) -> jsi::Value {
++        [setter, name](jsi::Runtime &rt, const jsi::Value &thisVal,
++                       const jsi::Value *args, size_t count) -> jsi::Value {
+           if (count < 1) {
+             throw jsi::JSError(rt, "Setter requires a value argument");
+           }
+-          auto native = Derived::fromValue(rt, thisVal);
+-          auto value =
+-              rnwgpu::JSIConverter<std::decay_t<ValueType>>::fromJSI(rt, args[0], false);
+-          (native.get()->*setter)(std::move(value));
+-          return jsi::Value::undefined();
++          try {
++            auto native = Derived::fromValue(rt, thisVal);
++            auto value =
++                rnwgpu::JSIConverter<std::decay_t<ValueType>>::fromJSI(rt, args[0], false);
++            (native.get()->*setter)(std::move(value));
++            return jsi::Value::undefined();
++          } catch (const jsi::JSError &) {
++            throw;
++          } catch (const std::exception &e) {
++            throw jsi::JSError(rt, std::string(name) + ": " + e.what());
++          }
+         });
+ 
+     auto objectCtor = runtime.global().getPropertyAsObject(runtime, "Object");
+diff --git a/node_modules/react-native-webgpu/cpp/rnwgpu/api/GPUExternalTexture.cpp b/node_modules/react-native-webgpu/cpp/rnwgpu/api/GPUExternalTexture.cpp
+index 44b2ea4..23342a3 100644
+--- a/node_modules/react-native-webgpu/cpp/rnwgpu/api/GPUExternalTexture.cpp
++++ b/node_modules/react-native-webgpu/cpp/rnwgpu/api/GPUExternalTexture.cpp
+@@ -8,6 +8,10 @@
+ 
+ #include "GPUExternalTextureDescriptor.h"
+ 
++#if defined(__ANDROID__)
++#include <android/log.h>
++#endif
++
+ namespace rnwgpu {
+ 
+ // Identity gamut (BT.709 -> sRGB, same primaries) as a 3x3 column-major matrix.
+@@ -288,6 +292,13 @@ std::shared_ptr<GPUExternalTexture> GPUExternalTexture::Create(
+   begin.initialized = true;
+   begin.concurrentRead = false;
+   wgpu::SharedTextureMemoryVkImageLayoutBeginState beginLayout{};
++  // Acquire with VK_IMAGE_LAYOUT_GENERAL, not the default 0 (UNDEFINED): a
++  // transition whose oldLayout is UNDEFINED permits the driver to discard the
++  // image contents (Dawn maps newLayout==UNDEFINED to exactly that). Mali and
++  // Adreno preserve the decoder's pixels anyway; Samsung Xclipse (AMD PAL)
++  // may not for the chroma planes of vendor YUV layouts.
++  beginLayout.oldLayout = 1 /* VK_IMAGE_LAYOUT_GENERAL */;
++  beginLayout.newLayout = 1 /* VK_IMAGE_LAYOUT_GENERAL */;
+   begin.nextInChain = &beginLayout;
+   if (!memory.BeginAccess(texture, &begin)) {
+     throw std::runtime_error(
+@@ -311,8 +322,38 @@ std::shared_ptr<GPUExternalTexture> GPUExternalTexture::Create(
+     wgpu::SharedTextureMemoryProperties props{};
+     props.nextInChain = &ahbProps;
+     if (memory.GetProperties(&props)) {
+-      yuvToRgbMatrix = makeYuvToRgbMatrix(ahbProps.yCbCrInfo.vkYCbCrModel,
+-                                          ahbProps.yCbCrInfo.vkYCbCrRange);
++      const auto &y = ahbProps.yCbCrInfo;
++      // One-shot diagnostic: the driver-reported import properties decide who
++      // owns the YUV->RGB conversion, and they differ per gralloc/driver.
++      static bool loggedYcbcrInfo = false;
++      if (!loggedYcbcrInfo) {
++        loggedYcbcrInfo = true;
++        __android_log_print(
++            ANDROID_LOG_INFO, "rnwgpu",
++            "[huntVideoColor] texFormat=%u vkFormat=%u externalFormat=%llu "
++            "model=%u range=%u swizzle=%u,%u,%u,%u chromaOffset=%u,%u "
++            "chromaFilter=%u",
++            static_cast<unsigned>(texture.GetFormat()),
++            static_cast<unsigned>(y.vkFormat),
++            static_cast<unsigned long long>(y.externalFormat),
++            static_cast<unsigned>(y.vkYCbCrModel),
++            static_cast<unsigned>(y.vkYCbCrRange),
++            static_cast<unsigned>(y.vkComponentSwizzleRed),
++            static_cast<unsigned>(y.vkComponentSwizzleGreen),
++            static_cast<unsigned>(y.vkComponentSwizzleBlue),
++            static_cast<unsigned>(y.vkComponentSwizzleAlpha),
++            static_cast<unsigned>(y.vkXChromaOffset),
++            static_cast<unsigned>(y.vkYChromaOffset),
++            static_cast<unsigned>(y.vkChromaFilter));
++      }
++      // NOTE: react-native-video-texture never delivers YUV AHardwareBuffers
++      // anymore — its GlVideoBridge converts decoder frames to RGBA8 before
++      // they get here, precisely because sampling vendor YUV layouts through
++      // Dawn's identity YCbCr conversion is driver roulette (Samsung Xclipse
++      // renders them green/teal; see the [huntVideoColor] log above for what
++      // the driver reports if one slips through). This branch remains for
++      // other producers.
++      yuvToRgbMatrix = makeYuvToRgbMatrix(y.vkYCbCrModel, y.vkYCbCrRange);
+     } else {
+       // Fall back to the Android camera norm rather than passthrough.
+       yuvToRgbMatrix = makeYuvToRgbMatrix(/* YCBCR_601 */ 3,
 diff --git a/node_modules/react-native-webgpu/cpp/rnwgpu/api/GPUExternalTexture.h b/node_modules/react-native-webgpu/cpp/rnwgpu/api/GPUExternalTexture.h
 index 917909e..c67ea00 100644
 --- a/node_modules/react-native-webgpu/cpp/rnwgpu/api/GPUExternalTexture.h

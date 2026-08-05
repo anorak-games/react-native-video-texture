@@ -63,11 +63,11 @@ JNIEXPORT void JNICALL Java_expo_modules_videotexture_FrameSourceNative_nativeDe
   holder(providerPtr)->detachCommandTarget(env);
 }
 
-JNIEXPORT void JNICALL Java_expo_modules_videotexture_FrameSourceNative_nativePushFrame(
+JNIEXPORT jlong JNICALL Java_expo_modules_videotexture_FrameSourceNative_nativePushFrame(
     JNIEnv *env, jclass, jlong providerPtr, jobject hardwareBuffer, jdouble ptsSec,
     jlong generation) {
   AHardwareBuffer *buffer = AHardwareBuffer_fromHardwareBuffer(env, hardwareBuffer);
-  holder(providerPtr)->pushFrame(buffer, ptsSec, generation);
+  return static_cast<jlong>(holder(providerPtr)->pushFrame(buffer, ptsSec, generation));
 }
 
 JNIEXPORT void JNICALL Java_expo_modules_videotexture_FrameSourceNative_nativeClearLatest(

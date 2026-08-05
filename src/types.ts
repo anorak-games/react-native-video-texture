@@ -41,8 +41,8 @@ export interface LoadClipOptions {
 export interface VideoFrame {
     /**
      * +1-retained CVPixelBufferRef (iOS) / AHardwareBuffer* (Android) — exactly what
-     * RNWebGPU.createVideoFrameFromNativeBuffer() accepts. Since the wrap retains
-     * internally, call releaseFrame(handle) right after wrapping.
+     * RNWebGPU.createVideoFrameFromNativeBuffer() accepts. Call releaseFrame(handle)
+     * only after all GPU work using this frame has completed.
      */
     handle: bigint;
     /**

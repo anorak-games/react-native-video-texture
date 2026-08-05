@@ -19,7 +19,7 @@ class AndroidFrameProvider : public FrameProvider {
 
   // Producer side (JNI, decoder thread). `ptsSec` is forward media time for this frame and
   // travels with it so the consumer cannot simulate against a different frame than it draws.
-  void pushFrame(AHardwareBuffer *buffer, double ptsSec, int64_t generation);
+  uint64_t pushFrame(AHardwareBuffer *buffer, double ptsSec, int64_t generation);
   void clearLatest();
   void updateTransport(std::string uri, int status, int64_t statusSeq, int64_t errorSeq,
                        std::string errorMessage, double durationSec, double actualRate,
@@ -43,6 +43,7 @@ class AndroidFrameProvider : public FrameProvider {
   std::mutex mutex_;
   AHardwareBuffer *latest_ = nullptr;
   bool latestIsNew_ = false;
+  bool loggedBufferDescription_ = false;
   double latestPtsSec_ = -1.0;
   int64_t latestGeneration_ = 0;
   TransportSnapshot transport_;
@@ -54,7 +55,10 @@ class AndroidFrameProvider : public FrameProvider {
   jmethodID setRateMethod_ = nullptr;
   jmethodID rampRateMethod_ = nullptr;
   jmethodID setVolumeMethod_ = nullptr;
+  jmethodID releaseFrameMethod_ = nullptr;
   const std::string pixelFormat_;
+
+  void releaseImage(AHardwareBuffer *buffer);
 };
 
 }  // namespace videotexture

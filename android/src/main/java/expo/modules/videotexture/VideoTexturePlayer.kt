@@ -42,11 +42,16 @@ class VideoTexturePlayer(
     require(!VideoSource.IS_EMULATOR) {
       "VideoTexture is not supported on the Android emulator — use a physical device"
     }
-    // Decoded Android frames are opaque YCbCr AHardwareBuffers; there is no BGRA path.
-    require(pixelFormat == "nv12") { "VideoTexture on Android supports only 'nv12', got '$pixelFormat'" }
+    // Frames are converted to RGBA by GlVideoBridge before they reach WebGPU,
+    // whatever the decoder produced, so the delivered format is always
+    // 'bgra8'. 'nv12' is accepted as the legacy request (it is the JS-side
+    // default) but no longer describes the buffers.
+    require(pixelFormat == "nv12" || pixelFormat == "bgra8") {
+      "VideoTexture on Android supports 'nv12' (legacy alias) or 'bgra8', got '$pixelFormat'"
+    }
     nextId += 1
     frameSourceKey = "player$nextId"
-    providerPtr = FrameSourceNative.nativeCreate(pixelFormat)
+    providerPtr = FrameSourceNative.nativeCreate("bgra8")
     val context = requireNotNull(appContext.reactContext) { "VideoTexture: no Android context" }
     videoSource = VideoSource(context, providerPtr)
     videoSource.delegate = this
@@ -148,6 +153,11 @@ class VideoTexturePlayer(
   @Keep
   fun dispatchSetVolumeFromNative(volume: Double) {
     setVolume(volume)
+  }
+
+  @Keep
+  fun dispatchReleaseFrameFromNative(handle: Long) {
+    videoSource.releaseFrame(handle)
   }
 
   fun setVolume(value: Double) {
