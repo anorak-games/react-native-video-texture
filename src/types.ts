@@ -13,10 +13,11 @@ export type VideoPlayerStatus = 'idle' | 'loading' | 'ready' | 'playing' | 'ende
 /**
  * Transport loop mode.
  * - `'off'` (default): the clip plays once and settles at status `'ended'`.
- * - `'boomerang'`: native plays the clip forward→reverse→forward seamlessly (video
- *   boomerangs, audio keeps playing forward and loops).
+ * - `'loop'`: native loops the clip seamlessly (no wrap-around hitch). `startSec` applies
+ *   to the first cycle only; every wrap restarts at 0 — a pre-baked loop file's seam is
+ *   frame(last)→frame(0). Status `'ended'` never fires.
  */
-export type VideoLoopMode = 'off' | 'boomerang';
+export type VideoLoopMode = 'off' | 'loop';
 
 export type VideoPixelFormat = 'bgra8' | 'nv12';
 
@@ -46,8 +47,8 @@ export interface VideoFrame {
      */
     handle: bigint;
     /**
-     * Media time of THIS frame, in seconds. It moves backwards during boomerang reverse
-     * playback and is negative when unknown.
+     * Media time of THIS frame, in seconds. Negative when unknown. In `'loop'` mode it
+     * sawtooths 0→duration→0, one rise per cycle.
      *
      * Exact on iOS (the item time the buffer was fetched for). On Android it is the 60Hz
      * player-position snapshot extrapolated by wall clock, so up to ~16ms stale: ExoPlayer
@@ -104,8 +105,11 @@ export declare class VideoTexturePlayer extends SharedObject {
 /** Shape of the `VideoTexture` Expo module as exposed to JS. */
 export interface VideoTextureNativeModule {
     readonly VideoTexturePlayer: typeof VideoTexturePlayer;
-    /** Absent on older native builds — always feature-check before calling. */
-    prebuildBoomerang?: (uri: string) => Promise<boolean>;
+    /**
+     * One-shot boomerang render: `inputUri` → `[fwd][rev]` file at `outputPath`.
+     * Resolves with `outputPath`; rejects with a message on any failure.
+     */
+    makeBoomerang: (inputUri: string, outputPath: string) => Promise<string>;
 }
 
 /**

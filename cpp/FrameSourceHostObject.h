@@ -16,8 +16,7 @@ namespace videotexture {
 struct AcquiredFrame {
   /// +1-retained platform handle, or nullptr when nothing new was decoded.
   void *handle = nullptr;
-  /// Forward media time of THIS frame, in seconds — the same public timeline
-  /// `currentTimeSec` reports, i.e. already through the boomerang triangle-wave remap.
+  /// Media time of THIS frame, in seconds — the same timeline `currentTimeSec` reports.
   /// Negative when unknown.
   double ptsSec = -1.0;
   /// Clip generation this frame belongs to; bumped on every loadClip. Lets the consumer
