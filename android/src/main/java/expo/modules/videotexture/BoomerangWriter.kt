@@ -10,57 +10,38 @@ import android.media.MediaMuxer
 import android.net.Uri
 import java.io.File
 import java.nio.ByteBuffer
-import java.security.MessageDigest
-import java.util.concurrent.ConcurrentHashMap
 
-/// Builds the boomerang playback assets — Android analogue of ios/BoomerangComposition.swift.
+/// One-shot boomerang render — Android analogue of ios/BoomerangWriter.swift.
 ///
-/// ExoPlayer cannot play in reverse and Android has no AVComposition, so the boomerang is
-/// realised as a TWO-ITEM PLAYLIST: [original, reversed-file] with REPEAT_MODE_ALL — video
-/// plays fwd,rev,fwd,rev…, audio always forward (the reversed file carries the ORIGINAL
-/// forward audio). The reversed video is pre-rendered GOP-by-GOP with MediaCodec (bounded
-/// memory) and cached in cacheDir keyed by the source URI, so it is built at most once.
-object BoomerangComposition {
-  data class Built(val reversedUri: Uri, val forwardLenSec: Double)
+/// Writes `[forward 0..N-1][reverse N-2..1]` (both duplicate endpoint frames dropped, so
+/// neither the turnaround nor the loop seam holds a frame) plus the source's forward audio
+/// twice, to a single self-contained mp4 that loops seamlessly with a plain `'loop'` mode.
+/// It simulates the eventual server-side pre-bake; nothing here touches playback.
+///
+/// Both legs go through ONE encoder instance: MediaMuxer allows a single addTrack (one
+/// SPS/PPS) per track, so the forward leg cannot be sample-copied from the source while the
+/// reverse leg is freshly encoded. Cost: the forward leg is a second-generation encode,
+/// mitigated by rendering at source resolution and source bitrate. The reverse leg is
+/// decoded GOP-by-GOP from the last group to the first through a raw spool file, so peak
+/// memory stays at ~2 frames regardless of resolution or clip length (a whole-clip reverse
+/// would need gigabytes at 2160p).
+object BoomerangWriter {
 
-  private val uriLocks = ConcurrentHashMap<String, Any>()
-
-  /// Synchronous build (call from a background thread). Returns null on any failure —
-  /// callers must stay on the plain forward loop in that case (iOS-documented behavior).
-  fun buildSync(context: Context, sourceUri: String): Built? {
-    val lock = uriLocks.getOrPut(sourceUri) { Any() }
-    synchronized(lock) {
-      return try {
-        buildLocked(context, sourceUri)
-      } catch (_: Throwable) {
-        null
-      }
-    }
-  }
-
-  private fun buildLocked(context: Context, sourceUri: String): Built? {
-    val probe = probeSource(context, sourceUri) ?: return null
-
-    val cached = cachedReversedFile(context, sourceUri)
-    if (!cached.exists()) {
-      val tmp = File(cached.parentFile, "${cached.name}.tmp")
+  /// Render `sourceUri` as a boomerang to `outputPath`, overwriting any existing file.
+  /// Synchronous — call from a background thread. Throws with a message on any failure.
+  fun writeSync(context: Context, sourceUri: String, outputPath: String) {
+    val probe = probeSource(context, sourceUri)
+    val out = File(outputPath)
+    out.parentFile?.mkdirs()
+    val tmp = File(out.parentFile, "${out.name}.tmp")
+    tmp.delete()
+    try {
+      renderBoomerang(context, sourceUri, probe, tmp)
+      out.delete()
+      check(tmp.renameTo(out)) { "makeBoomerang: rename to $outputPath failed" }
+    } finally {
       tmp.delete()
-      try {
-        renderReversed(context, sourceUri, probe, tmp)
-        check(tmp.renameTo(cached)) { "boomerang: rename failed" }
-      } finally {
-        tmp.delete()
-      }
     }
-    return Built(Uri.fromFile(cached), probe.durationSec)
-  }
-
-  /// Stable cache file keyed by the source URI hash. The filename version identifies the render
-  /// format and must change when cached output compatibility changes.
-  private fun cachedReversedFile(context: Context, sourceUri: String): File {
-    val digest = MessageDigest.getInstance("SHA-1").digest(sourceUri.toByteArray())
-    val key = digest.joinToString("") { "%02x".format(it) }.take(20)
-    return File(context.cacheDir, "boomerang-rev-v2-$key.mp4")
   }
 
   // MARK: - Probe
@@ -70,10 +51,9 @@ object BoomerangComposition {
     val audioTrack: Int,
     val width: Int,
     val height: Int,
-    val durationSec: Double,
   )
 
-  private fun probeSource(context: Context, sourceUri: String): SourceProbe? {
+  private fun probeSource(context: Context, sourceUri: String): SourceProbe {
     val extractor = MediaExtractor()
     try {
       extractor.setDataSource(context, Uri.parse(sourceUri), null)
@@ -81,7 +61,6 @@ object BoomerangComposition {
       var audio = -1
       var width = 0
       var height = 0
-      var durationUs = 0L
       for (i in 0 until extractor.trackCount) {
         val format = extractor.getTrackFormat(i)
         val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
@@ -89,26 +68,20 @@ object BoomerangComposition {
           video = i
           width = format.getInteger(MediaFormat.KEY_WIDTH)
           height = format.getInteger(MediaFormat.KEY_HEIGHT)
-          durationUs = format.getLong(MediaFormat.KEY_DURATION)
         } else if (mime.startsWith("audio/") && audio < 0) {
           audio = i
         }
       }
-      if (video < 0 || durationUs <= 0) {
-        return null
-      }
-      return SourceProbe(video, audio, width, height, durationUs / 1_000_000.0)
+      check(video >= 0) { "makeBoomerang: no video track in $sourceUri" }
+      return SourceProbe(video, audio, width, height)
     } finally {
       extractor.release()
     }
   }
 
-  // MARK: - Reverse render
+  // MARK: - Render
 
-  /// Decode GOP-by-GOP from the LAST group to the first (bounded memory: one GOP of I420
-  /// frames at a time), re-encode in reversed presentation order with fresh monotonic PTS,
-  /// and mux with the source's forward audio copied compressed (no audio re-encode).
-  private fun renderReversed(context: Context, sourceUri: String, probe: SourceProbe, out: File) {
+  private fun renderBoomerang(context: Context, sourceUri: String, probe: SourceProbe, out: File) {
     val spoolFile = File(out.parentFile, "${out.name}.gop.raw")
     val extractor = MediaExtractor()
     var muxerToRelease: MediaMuxer? = null
@@ -135,7 +108,8 @@ object BoomerangComposition {
         sampleTimesUs.add(t)
         extractor.advance()
       }
-      check(sampleTimesUs.isNotEmpty() && syncPositions.isNotEmpty()) { "boomerang: empty video track" }
+      check(sampleTimesUs.isNotEmpty() && syncPositions.isNotEmpty()) { "makeBoomerang: empty video track" }
+      check(sampleTimesUs.size >= 2) { "makeBoomerang: source has fewer than 2 video frames" }
       val sortedPts = sampleTimesUs.sorted()
       val frameDurUs = if (sortedPts.size > 1) {
         (sortedPts.last() - sortedPts.first()) / (sortedPts.size - 1)
@@ -162,7 +136,7 @@ object BoomerangComposition {
       decoder.start()
       decoderStarted = true
 
-      // Keep both directions at source resolution so image quality remains consistent at each
+      // Keep both legs at source resolution so image quality remains consistent at the
       // turnaround. Peak memory stays bounded because rendering proceeds one GOP at a time.
       val (renderWidth, renderHeight) = evenSize(probe.width, probe.height)
       val encFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, renderWidth, renderHeight)
@@ -171,7 +145,7 @@ object BoomerangComposition {
         MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible,
       )
       // Match the source bitrate where it is declared. The fallback has to scale with the frame:
-      // a fixed 8 Mbps is fine at 720p but would make a 4K reverse leg mushy, which defeats
+      // a fixed 8 Mbps is fine at 720p but would make a 4K render mushy, which defeats
       // rendering it at source resolution in the first place. ~0.15 bits/pixel/frame is a
       // reasonable h264 target (≈37 Mbps at 2160p30, ≈4 Mbps at 720p30).
       val srcBitRate = if (videoFormat.containsKey(MediaFormat.KEY_BIT_RATE)) {
@@ -208,7 +182,7 @@ object BoomerangComposition {
           val idx = encoder.dequeueOutputBuffer(encInfo, if (endOfStream) 10_000L else 0L)
           when {
             idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-              check(videoTrackOut < 0) { "boomerang: encoder format changed twice" }
+              check(videoTrackOut < 0) { "makeBoomerang: encoder format changed twice" }
               videoTrackOut = muxer.addTrack(encoder.outputFormat)
               muxer.start()
               muxerStarted = true
@@ -216,7 +190,7 @@ object BoomerangComposition {
             idx >= 0 -> {
               val buf = requireNotNull(encoder.getOutputBuffer(idx))
               if (encInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 && encInfo.size > 0) {
-                check(muxerStarted) { "boomerang: encoder output before muxer start" }
+                check(muxerStarted) { "makeBoomerang: encoder output before muxer start" }
                 muxer.writeSampleData(videoTrackOut, buf, encInfo)
               }
               val eos = encInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
@@ -239,7 +213,7 @@ object BoomerangComposition {
           if (frame == null) {
             encoder.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
           } else {
-            val image = requireNotNull(encoder.getInputImage(inIdx)) { "boomerang: encoder has no input Image" }
+            val image = requireNotNull(encoder.getInputImage(inIdx)) { "makeBoomerang: encoder has no input Image" }
             fillImageFromI420(image, frame, renderWidth, renderHeight)
             val ptsUs = outFrameIndex * frameDurUs
             outFrameIndex += 1
@@ -252,11 +226,42 @@ object BoomerangComposition {
 
       val frameSize = renderWidth * renderHeight * 3 / 2
       val frameBuf = ByteArray(frameSize)
+      // Counted from what pass 1 actually decodes (not container samples), so the pass-2
+      // endpoint guard and the audio leg duration agree with the frames that were written.
+      var totalSourceFrames = 0
       try {
         java.io.RandomAccessFile(spoolFile, "rw").use { spool ->
-          // GOPs last → first; each GOP decoded forward into the spool file (one
-          // frame slot per output index), then emitted reversed via seeks — memory
-          // stays at ~2 frames regardless of GOP length.
+          // Pass 1 (forward): GOPs first → last, each GOP decoded into the spool file (one
+          // frame slot per arrival index), then emitted in presentation order via seeks.
+          for (g in syncPositions.indices) {
+            val startSample = syncPositions[g]
+            val endSample = if (g + 1 < syncPositions.size) syncPositions[g + 1] else sampleTimesUs.size
+            val ptsInArrival = decodeGopToSpool(
+              extractor,
+              decoder,
+              sampleTimesUs[startSample],
+              endSample - startSample,
+              spool,
+              frameBuf,
+              renderWidth,
+              renderHeight,
+            )
+            val order = ptsInArrival.indices.sortedBy { ptsInArrival[it] }
+            for (arrival in order) {
+              spool.seek(arrival.toLong() * frameSize)
+              spool.readFully(frameBuf)
+              encodeFrame(frameBuf)
+              totalSourceFrames += 1
+            }
+          }
+          check(totalSourceFrames >= 2) { "makeBoomerang: decoded fewer than 2 video frames" }
+
+          // Pass 2 (reverse): GOPs last → first, each GOP's frames emitted in reverse
+          // presentation order — global presentation index N-1 down to 0. The two duplicate
+          // endpoint frames are dropped by a GLOBAL index guard (emit only 1..N-2): the
+          // turnaround never repeats frame N-1 and the loop seam never repeats frame 0.
+          // Guarding per-GOP instead would silently drop a frame at every GOP boundary.
+          var srcIndex = totalSourceFrames - 1
           for (g in syncPositions.indices.reversed()) {
             val startSample = syncPositions[g]
             val endSample = if (g + 1 < syncPositions.size) syncPositions[g + 1] else sampleTimesUs.size
@@ -272,37 +277,57 @@ object BoomerangComposition {
             )
             val order = ptsInArrival.indices.sortedBy { ptsInArrival[it] }
             for (o in order.indices.reversed()) {
-              spool.seek(order[o].toLong() * frameSize)
-              spool.readFully(frameBuf)
-              encodeFrame(frameBuf)
+              if (srcIndex in 1 until totalSourceFrames - 1) {
+                spool.seek(order[o].toLong() * frameSize)
+                spool.readFully(frameBuf)
+                encodeFrame(frameBuf)
+              }
+              srcIndex -= 1
             }
           }
         }
         encodeFrame(null)
         drainEncoder(true)
 
-        // Audio passthrough: forward audio, compressed samples copied as-is.
+        // Audio: the source's forward audio, twice, compressed samples copied as-is (never
+        // re-encoded). Copy 2 starts where the output's forward video leg ends. MediaMuxer
+        // requires strictly monotonic PTS per track, so BOTH copies are trimmed to the
+        // forward-leg duration (an audio track longer than the video leg would otherwise
+        // start copy 2 before copy 1 ended), and copy 2 additionally stops at the total
+        // video duration. Sample times are normalized so audio that does not start at 0
+        // cannot break monotonicity either.
         if (audioTrackOut >= 0) {
+          val forwardLegDurUs = totalSourceFrames.toLong() * frameDurUs
+          val totalVideoDurUs = (2L * totalSourceFrames - 2L) * frameDurUs
           extractor.unselectTrack(probe.videoTrack)
           extractor.selectTrack(probe.audioTrack)
-          extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
           val buf = ByteBuffer.allocate(1 shl 20)
           val info = MediaCodec.BufferInfo()
-          while (true) {
-            val size = extractor.readSampleData(buf, 0)
-            if (size < 0) break
-            info.set(
-              0,
-              size,
-              extractor.sampleTime,
-              if (extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) {
-                MediaCodec.BUFFER_FLAG_KEY_FRAME
-              } else {
-                0
-              },
-            )
-            muxer.writeSampleData(audioTrackOut, buf, info)
-            extractor.advance()
+          for (copy in 0 until 2) {
+            val offsetUs = copy * forwardLegDurUs
+            val limitUs = if (copy == 0) forwardLegDurUs else totalVideoDurUs - forwardLegDurUs
+            extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+            var basePtsUs = -1L
+            while (true) {
+              val size = extractor.readSampleData(buf, 0)
+              if (size < 0) break
+              val sampleTimeUs = extractor.sampleTime
+              if (basePtsUs < 0) basePtsUs = sampleTimeUs
+              val relUs = sampleTimeUs - basePtsUs
+              if (relUs >= limitUs) break
+              info.set(
+                0,
+                size,
+                relUs + offsetUs,
+                if (extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) {
+                  MediaCodec.BUFFER_FLAG_KEY_FRAME
+                } else {
+                  0
+                },
+              )
+              muxer.writeSampleData(audioTrackOut, buf, info)
+              extractor.advance()
+            }
           }
         }
       } finally {
@@ -363,7 +388,7 @@ object BoomerangComposition {
       val outIdx = decoder.dequeueOutputBuffer(info, 10_000L)
       if (outIdx >= 0) {
         if (info.size > 0) {
-          val image = requireNotNull(decoder.getOutputImage(outIdx)) { "boomerang: decoder has no output Image" }
+          val image = requireNotNull(decoder.getOutputImage(outIdx)) { "makeBoomerang: decoder has no output Image" }
           copyImageToI420(image, frameBuf, renderWidth, renderHeight)
           spool.seek(ptsInArrival.size.toLong() * frameBuf.size)
           spool.write(frameBuf)
@@ -404,7 +429,7 @@ object BoomerangComposition {
     }
   }
 
-  /// Round down to even dimensions — h264 requires them. No scaling: the reversed leg renders
+  /// Round down to even dimensions — h264 requires them. No scaling: both legs render
   /// at source resolution (see the call site).
   private fun evenSize(width: Int, height: Int): Pair<Int, Int> {
     fun even(value: Int): Int = maxOf(2, value and -2)

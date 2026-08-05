@@ -70,6 +70,10 @@ class VideoSource(
   private var currentUri: String? = null
   private var shouldAutoPlay = true
   private var loopMode = "off"
+  /// The loop mode the current player was configured with. The same-URI reuse path must
+  /// not keep a player whose playlist shape (single item vs looping pair) no longer
+  /// matches the requested mode.
+  private var installedLoopMode = "off"
   private var desiredRate = 1.0
   private var armedClipStartSec: Double? = null
   private var endedReported = false
@@ -79,11 +83,6 @@ class VideoSource(
   @Volatile var volume = 1.0
     private set
   private var released = false
-
-  // Boomerang: two-item playlist [forward, reversed]; time reported as forward media time.
-  private var boomerangActive = false
-  private var boomerangForwardLen = 0.0
-  private var boomerangBuildToken = 0
 
   // Extrapolation tuple so currentTime is safe off the main thread.
   @Volatile private var timeSnapshot = TimeSnapshot(0.0, 0L, 0.0, false)
@@ -121,18 +120,11 @@ class VideoSource(
     shouldAutoPlay = autoPlay
   }
 
+  /// Select the transport loop mode: `"loop"` or anything else = `"off"`. Takes effect on
+  /// the next `loadUri` — `loadClip` always sets the mode before loading, and the reuse
+  /// guard on `installedLoopMode` forces a fresh playlist when the mode changed.
   fun setLoopMode(mode: String) {
-    if (loopMode == mode) return
-    loopMode = mode
-    val p = player ?: return
-    p.repeatMode = if (mode == "boomerang") Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
-    if (mode == "boomerang") {
-      currentUri?.let { startBoomerangBuild(it) }
-    } else {
-      boomerangBuildToken += 1
-      boomerangActive = false
-      if (p.mediaItemCount > 1) p.removeMediaItem(1)
-    }
+    loopMode = if (mode == "loop") "loop" else "off"
   }
 
   fun armClipStart(sec: Double) {
@@ -151,8 +143,9 @@ class VideoSource(
       delegate?.onStatusChange("idle")
       return
     }
-    if (uri == currentUri && player != null) {
+    if (uri == currentUri && player != null && loopMode == installedLoopMode) {
       // Reuse path: same clip stays loaded; a pending armed start is applied as a seek.
+      // (Guarded on the installed loop mode: a mode change needs a fresh playlist shape.)
       endedReported = false
       armedClipStartSec?.let { start ->
         armedClipStartSec = null
@@ -165,8 +158,6 @@ class VideoSource(
 
     currentUri = uri
     endedReported = false
-    boomerangActive = false
-    boomerangBuildToken += 1
     delegate?.onStatusChange("loading")
 
     val generation = loadGeneration
@@ -188,37 +179,28 @@ class VideoSource(
           val p = ensurePlayer()
           val startSec = armedClipStartSec ?: 0.0
           armedClipStartSec = null
-          p.setMediaItem(MediaItem.fromUri(uri), (startSec * 1000).toLong())
+          val item = MediaItem.fromUri(uri)
+          if (loopMode == "loop") {
+            // Seamless loop: TWO identical items + REPEAT_MODE_ALL, not REPEAT_MODE_ONE.
+            // ExoPlayer prewarms the next playlist period, so the item transition is
+            // genuinely gapless (the same mechanism the old boomerang turnaround relied
+            // on); REPEAT_MODE_ONE resets the renderer at the wrap and can hitch.
+            // startSec applies to the FIRST cycle only: the loop must wrap to 0 because
+            // a pre-baked loop file's seam is frame(last)→frame(0).
+            p.setMediaItems(listOf(item, item), 0, (startSec * 1000).toLong())
+          } else {
+            p.setMediaItem(item, (startSec * 1000).toLong())
+          }
+          installedLoopMode = loopMode
           p.playWhenReady = shouldAutoPlay
-          p.repeatMode = if (loopMode == "boomerang") Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
+          p.repeatMode = if (loopMode == "loop") Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
           p.playbackParameters = PlaybackParameters(desiredRate.toFloat())
           p.prepare()
-          if (loopMode == "boomerang") {
-            startBoomerangBuild(uri)
-          }
         } catch (_: Exception) {
           failPlayback()
         }
       }
     }
-  }
-
-  /// Kick (or reuse) the reversed-file build; on success append it as playlist item 1.
-  /// Token + URI guards drop stale results, mirroring the Swift build-token dance.
-  private fun startBoomerangBuild(uri: String) {
-    boomerangBuildToken += 1
-    val token = boomerangBuildToken
-    Thread {
-      val built = BoomerangComposition.buildSync(context, uri)
-      mainHandler.post {
-        if (built == null || token != boomerangBuildToken || uri != currentUri) return@post
-        val p = player ?: return@post
-        if (p.mediaItemCount > 1) p.removeMediaItem(1)
-        p.addMediaItem(MediaItem.fromUri(built.reversedUri))
-        boomerangForwardLen = built.forwardLenSec
-        boomerangActive = true
-      }
-    }.start()
   }
 
   fun play() {
@@ -242,10 +224,16 @@ class VideoSource(
   fun seek(sec: Double) {
     val p = player ?: return
     endedReported = false
-    if (boomerangActive) {
-      // Seeks are forward-media-time; land them in the forward playlist item.
-      val clamped = sec.coerceIn(0.0, (boomerangForwardLen - 0.1).coerceAtLeast(0.0))
-      p.seekTo(0, (clamped * 1000).toLong())
+    if (loopMode == "loop") {
+      // Target the CURRENT playlist item so a seek stays in this cycle instead of
+      // jumping back to item 0. `duration` is per-item under a playlist.
+      val durationMs = p.duration
+      val clampedSec = if (durationMs != C.TIME_UNSET) {
+        min(sec, durationMs / 1000.0 - 0.1)
+      } else {
+        sec
+      }
+      p.seekTo(p.currentMediaItemIndex, (max(0.0, clampedSec) * 1000).toLong())
       return
     }
     val durationMs = p.duration
@@ -284,7 +272,7 @@ class VideoSource(
         Player.STATE_BUFFERING -> delegate?.onStatusChange("loading")
         Player.STATE_READY -> delegate?.onStatusChange("ready")
         Player.STATE_ENDED -> {
-          if (loopMode == "boomerang") {
+          if (loopMode == "loop") {
             // REPEAT_MODE_ALL loops before ENDED; if it ever fires, keep looping.
             player?.seekTo(0)
             player?.play()
@@ -311,27 +299,17 @@ class VideoSource(
   private val timeTicker = object : Runnable {
     override fun run() {
       val p = player ?: return
-      val positionSec = forwardMediaTime(p)
-      val direction = if (boomerangActive && p.currentMediaItemIndex == 1) -1.0 else 1.0
+      // `currentPosition` is per-item, so under the loop-mode two-item playlist it is
+      // already the 0→L sawtooth a loop should report.
+      val positionSec = p.currentPosition / 1000.0
       timeSnapshot = TimeSnapshot(
         positionSec,
         SystemClock.uptimeMillis(),
-        p.playbackParameters.speed.toDouble() * direction,
+        p.playbackParameters.speed.toDouble(),
         p.isPlaying,
       )
       mainHandler.postDelayed(this, 16)
     }
-  }
-
-  /// Every JS consumer keys off FORWARD media time. Playlist item 0 plays the
-  /// original (position IS media time); item 1 plays the reversed file, so
-  /// media time is L - position.
-  private fun forwardMediaTime(p: ExoPlayer): Double {
-    val posSec = p.currentPosition / 1000.0
-    if (!boomerangActive || p.currentMediaItemIndex == 0) {
-      return posSec
-    }
-    return (boomerangForwardLen - posSec).coerceAtLeast(0.0)
   }
 
   private fun ensurePlayer(): ExoPlayer {
@@ -530,8 +508,6 @@ class VideoSource(
 
   private fun teardown() {
     mainHandler.removeCallbacks(timeTicker)
-    boomerangBuildToken += 1
-    boomerangActive = false
     player?.release()
     player = null
     currentUri = null

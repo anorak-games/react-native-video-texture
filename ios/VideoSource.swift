@@ -35,29 +35,31 @@ final class VideoSource: NSObject {
   /// converts to BGRA regardless (see bgraPixelBufferForSimulator).
   let pixelFormat: String
 
-  // MARK: - boomerang loop state
-  /// Transport loop mode for the current clip. `"off"` = unchanged behaviour;
-  /// `"boomerang"` = seamless forward↔reverse video with forward-looping audio.
+  // MARK: - loop state
+  /// Transport loop mode for the current clip: `"off"` (play once, report 'ended') or
+  /// `"loop"` (seamless native loop via `AVPlayerLooper`).
   private var loopMode: String = "off"
-  /// True once the looping boomerang composition has been swapped in for the active clip.
-  private var boomerangActive = false
-  /// Forward segment length L (seconds) of the active boomerang composition, for the remap.
-  private var boomerangForwardLen: Double = 0
-  /// Identifies the build in flight so a late completion for a stale clip is ignored.
-  private var boomerangBuildToken = 0
-  /// Gapless looper for the swapped-in composition. `AVPlayerLooper` cycles internal COPIES
-  /// of the template item with no decode-pipeline flush, eliminating the wrap-around hitch
-  /// that a manual seek-to-zero caused. Nil until the swap; invalidated on teardown/off.
-  private var boomerangLooper: AVPlayerLooper?
+  /// Gapless looper (`'loop'` mode). `AVPlayerLooper` cycles internal COPIES of the template
+  /// item with no decode-pipeline flush, eliminating the wrap-around hitch a manual
+  /// seek-to-zero would cause. Nil in `'off'` mode; torn down with the player.
+  private var looper: AVPlayerLooper?
   /// KVO on the queue player's `currentItem`. The looper plays fresh COPIES of the template,
   /// and an `AVPlayerItemVideoOutput` added to the template does NOT carry to the copies, so
   /// on every item change we re-attach a fresh output to the new current item.
   private var currentItemObserver: NSKeyValueObservation?
+  /// KVO on the AVPlayerLooper itself ('loop' mode). With no end observer and no status KVO
+  /// on the never-played template, this is the only place a broken file can surface.
+  private var looperStatusObserver: NSKeyValueObservation?
+  /// The loop mode the current player was configured with. The same-URI reuse path must not
+  /// keep a player whose shape (single item vs looper) no longer matches the requested mode.
+  private var installedLoopMode = "off"
 
   /// On-demand live time (one `player.currentTime()` query — a synchronous XPC to mediaserverd,
   /// so NEVER call this per-frame on the main thread; see `copyPixelBuffer` / the time observer).
+  /// Under a looper each cycle plays a fresh copy starting at 0, so in `'loop'` mode this
+  /// sawtooths 0→L→0 — which is what a loop should report.
   var currentTime: Double {
-    forwardMediaTime(player?.currentTime().seconds ?? 0)
+    player?.currentTime().seconds ?? 0
   }
 
   private(set) var volume: Double = 1
@@ -65,16 +67,6 @@ final class VideoSource: NSObject {
   func setVolume(_ value: Double) {
     volume = value.isFinite ? min(1, max(0, value)) : 1
     player?.volume = Float(volume)
-  }
-
-  /// Remap a raw player/composition time to the original forward media time. In boomerang mode
-  /// the player runs the [forward][reversed] composition while the public timeline remains
-  /// forward media time; identity passthrough otherwise.
-  private func forwardMediaTime(_ raw: Double) -> Double {
-    guard boomerangActive else { return raw }
-    let start = clipStartSec >= 0 ? clipStartSec : 0
-    return BoomerangComposition.compositionToMediaTime(
-      raw, clipLenSec: boomerangForwardLen, startOffsetSec: start)
   }
 
   var duration: Double {
@@ -124,34 +116,11 @@ final class VideoSource: NSObject {
     shouldAutoPlay = value
   }
 
-  /// Select the transport loop mode. `"boomerang"` enables the seamless forward↔reverse
-  /// loop; anything else is treated as `"off"`. Enabling it after a clip has loaded starts the
-  /// reverse build for the active URI.
+  /// Select the transport loop mode: `"loop"` or anything else = `"off"`. Takes effect on
+  /// the next `loadUri` — `loadClip` always sets the mode before loading, and the reuse
+  /// guard on `installedLoopMode` forces a fresh player when the mode changed.
   func setLoopMode(_ mode: String) {
-    let normalized = (mode == "boomerang") ? "boomerang" : "off"
-    guard normalized != loopMode else { return }
-    loopMode = normalized
-
-    if normalized == "boomerang" {
-      // A clip may already be loaded when boomerang mode is enabled.
-      if player != nil, !boomerangActive, let uri = currentUri,
-        let url = Self.resolvedURL(for: uri) {
-        startBoomerangBuild(sourceURL: url)
-      }
-    } else {
-      // Switching to "off": ignore any in-flight build (bump the token), disable the gapless
-      // looper, and drop boomerang state so end-of-clip handling reports a terminal snapshot.
-      // The currently running clip keeps playing; the next loadUri loads a
-      // plain forward clip (a fresh AVQueuePlayer with one item == AVPlayer behaviour).
-      boomerangBuildToken &+= 1
-      boomerangLooper?.disableLooping()
-      boomerangLooper = nil
-      currentItemObserver?.invalidate()
-      currentItemObserver = nil
-      boomerangOutputsByItem.removeAllObjects()
-      boomerangActive = false
-      boomerangForwardLen = 0
-    }
+    loopMode = (mode == "loop") ? "loop" : "off"
   }
 
   /// Resolve a uri string to a URL the same way `loadUri` does (file path vs remote).
@@ -172,8 +141,9 @@ final class VideoSource: NSObject {
       delegate?.videoSource(self, didChangeStatus: "idle")
       return
     }
-    // Same URI + player alive: skip teardown+reload.
-    if uri == currentUri, player != nil {
+    // Same URI + player alive: skip teardown+reload. (Guarded on the installed loop mode:
+    // a mode change needs a fresh player shape — single item vs looper.)
+    if uri == currentUri, player != nil, loopMode == installedLoopMode {
       // A new playback may reuse the same file; reset end-of-clip heuristics before seeking.
       lastPlaybackStartTime = CACurrentMediaTime()
       // Apply a freshly-armed clip start HERE, as a real seek — 0 included. `armClipStart` only
@@ -213,6 +183,12 @@ final class VideoSource: NSObject {
       return
     }
 
+    installedLoopMode = loopMode
+    if loopMode == "loop" {
+      installLooper(url: url)
+      return
+    }
+
     let asset = AVURLAsset(url: url)
     let item = AVPlayerItem(asset: asset)
     #if targetEnvironment(simulator)
@@ -223,9 +199,9 @@ final class VideoSource: NSObject {
     output.requestNotificationOfMediaDataChange(withAdvanceInterval: 1.0 / 30.0)
     item.add(output)
 
-    // AVQueuePlayer (an AVPlayer subclass — drop-in everywhere `player` is used) so the
-    // steady-state boomerang composition can be looped GAPLESSLY via AVPlayerLooper after the
-    // swap. With a single item it behaves exactly like AVPlayer, so OFF mode is unchanged.
+    // AVQueuePlayer (an AVPlayer subclass — drop-in everywhere `player` is used) so 'off'
+    // and 'loop' mode share one player type. With a single item it behaves exactly like
+    // AVPlayer.
     let avPlayer = AVQueuePlayer(playerItem: item)
     avPlayer.volume = Float(volume)
     // Keep the player clock advancing through brief decode stalls; the renderer holds its last frame.
@@ -256,28 +232,7 @@ final class VideoSource: NSObject {
         let durationSec = player.currentItem?.duration.seconds ?? 0
         let nearEnd = durationSec > 0.2 && (durationSec - currentSec) < 0.5
 
-        if self.loopMode == "boomerang" {
-          // Boomerang owns its loop and must never end paused.
-          if self.boomerangActive {
-            // Post-swap the AVPlayerLooper owns looping + position; a manual seek would fight
-            // it. If the player ever pauses unexpectedly, just nudge the rate back up.
-            if player.rate == 0 {
-              player.rate = self.desiredRate
-            }
-          } else if nearEnd {
-            // Pre-swap (plain forward fallback): if AVPlayer paused at the end without firing
-            // the end notification (some seek patterns swallow it), loop to start as a safety net.
-            self.loopToStart()
-          } else if currentSec < durationSec - 0.5 {
-            // Pre-swap mid-clip pause (decoder/audio-session hiccup) → resume in place.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-              guard let self, let p = self.player else { return }
-              if p.timeControlStatus == .paused && self.shouldAutoPlay && !self.pendingPlay {
-                p.rate = self.desiredRate
-              }
-            }
-          }
-        } else if nearEnd && playElapsed >= 1.5 {
+        if nearEnd && playElapsed >= 1.5 {
           self.delegate?.videoSourceDidPlayToEnd(self)
         } else if currentSec < durationSec - 0.5 {
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
@@ -302,119 +257,46 @@ final class VideoSource: NSObject {
     ) { [weak self] note in
       self?.handleItemDidPlayToEnd(note)
     }
-
-    // boomerang mode: keep playing the normal forward clip immediately (set up above),
-    // and build the reversed composition in the background. Swap to the seamless loop
-    // once it's ready. On any failure we simply stay on the forward clip.
-    if loopMode == "boomerang" {
-      startBoomerangBuild(sourceURL: url)
-    }
   }
 
-  /// Single end-of-clip handler shared by the forward item and the swapped-in boomerang
-  /// composition. The loop decision is keyed on `loopMode`, NOT `boomerangActive`, so native
-  /// owns looping for the WHOLE boomerang lifecycle — including the window BEFORE the reverse
-  /// composition has swapped in. Otherwise the forward clip would end, fall through to
-  /// `videoSourceDidPlayToEnd`, leaving playback locked on the last frame. In "off" mode the
-  /// terminal state is exposed through the transport snapshot.
-  private func handleItemDidPlayToEnd(_ note: Notification) {
-    guard let endedItem = note.object as? AVPlayerItem, endedItem === player?.currentItem else {
-      return
-    }
-    if loopMode == "boomerang" {
-      // Post-swap, AVPlayerLooper owns gapless looping (no manual seek) — this handler is no
-      // longer wired to the composition item, but guard defensively so a stray end is ignored.
-      if boomerangActive {
-        return
-      }
-      // Pre-swap: a plain forward loop fallback (a tiny seek blink is acceptable — it's
-      // transient until the reverse render swaps in). Never end paused or report an end.
-      loopToStart()
-      return
-    }
-    delegate?.videoSourceDidPlayToEnd(self)
-  }
-
-  /// Seek to the start and resume at the desired rate. Used by the boomerang loop (both the
-  /// pre-swap forward fallback and the post-swap seamless loop) so playback NEVER dead-ends.
-  private func loopToStart() {
-    guard let p = player else { return }
-    p.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-      guard let self, let p = self.player else { return }
-      // Re-apply the rate so the loop actually continues — actionAtItemEnd is .pause, so
-      // without this the player would sit paused on frame 0.
-      if self.shouldAutoPlay {
-        p.rate = self.desiredRate
-      }
-    }
-  }
-
-  /// Kick off the background reverse-render + composition build for `sourceURL`, then swap
-  /// the looping composition in for the currently-playing forward clip when it's ready.
-  /// A single one-time swap; preserves the live playback position, rate, and autoplay.
-  private func startBoomerangBuild(sourceURL: URL) {
-    boomerangBuildToken &+= 1
-    let token = boomerangBuildToken
-    let buildUri = currentUri
-    BoomerangComposition.build(sourceURL: sourceURL) { [weak self] built in
-      guard let self else { return }
-      // Bail if the clip changed (or another build superseded this one) while rendering.
-      guard token == self.boomerangBuildToken, buildUri == self.currentUri,
-        let built, let player = self.player
-      else {
-        return
-      }
-      self.swapInBoomerang(built: built, player: player)
-    }
-  }
-
-  /// Replace the live forward clip with the looping boomerang composition, looped GAPLESSLY
-  /// via `AVPlayerLooper`. The looper cycles internal COPIES of the template composition item
-  /// with no decode-pipeline flush — eliminating the wrap-around hitch that the old manual
-  /// seek-to-zero caused. Because an `AVPlayerItemVideoOutput` added to the template does NOT
-  /// carry to those copies, we attach a fresh output to whatever item becomes `currentItem`
-  /// (via KVO) and keep `self.videoOutput` pointed at it so the GPU renderer never stalls.
-  private func swapInBoomerang(built: BoomerangComposition.Built, player: AVPlayer) {
-    guard let queue = player as? AVQueuePlayer else { return }
-    // The item being replaced. The `.initial` KVO fire below still reports it as
-    // `currentItem` (the looper is installed afterwards); attaching a fresh output to it
-    // would be pure waste AND would race the `pullQueue` detach scheduled just below on
-    // the same item (AVPlayerItemVideoOutput is not thread-safe). Skip it explicitly.
-    let outgoingItem = playerItem
-
-    // Tear down the forward item's observers/output; the looper now owns the queue.
-    // Remove the status observer from the EXACT item it's registered on (not `playerItem`,
-    // which may already point elsewhere), then remove the live output from the current item.
-    if let observed = statusObservedItem {
-      observed.removeObserver(self, forKeyPath: "status")
-      statusObservedItem = nil
-    }
-    if let old = playerItem, let oldOutput = videoOutput {
-      // Detach on the pull queue (serial → after any in-flight pull) so `remove` can't race the
-      // background `copyPixelBuffer` on this output; the boomerang template below is unaffected.
-      pullQueue.async { old.remove(oldOutput) }
-    }
-    if let obs = endObserver {
-      NotificationCenter.default.removeObserver(obs)
-      endObserver = nil
-    }
-    currentItemObserver?.invalidate()
-    currentItemObserver = nil
-    boomerangOutputsByItem.removeAllObjects()
-
-    // Template item carries NO output (the looper plays copies; outputs don't carry) — output
-    // is attached per-current-item below.
-    //
-    // `AVPlayerLooper` enqueues replicas of the template and never plays the template itself,
-    // so its status remains unknown. Resume is driven by the current-item observation below.
-    let template = AVPlayerItem(asset: built.composition)
-    statusObservedItem = nil
+  /// Install an `AVQueuePlayer` + `AVPlayerLooper` for seamless looping of `url`, at load
+  /// time — no async build, no mid-playback swap. The looper cycles internal COPIES of the
+  /// template item with no decode-pipeline flush, so the wrap is gapless. The template
+  /// itself is NEVER played (its status stays `.unknown` forever), which shapes everything
+  /// here:
+  /// - the video output is attached per cycled item (outputs do not carry to the copies),
+  /// - "ready"/"error", the armed clip-start seek, and the pendingPlay resume are driven by
+  ///   a status KVO on the FIRST cycled item — the same `observeValue` flow as a plain load,
+  /// - no end observer is installed: a looped clip never "plays to end".
+  ///
+  /// `startSec` applies to the FIRST cycle only (as a deferred seek on that first item): the
+  /// loop must wrap to 0, because a pre-baked loop file's seam is frame(last)→frame(0) —
+  /// wrapping anywhere else would jump.
+  private func installLooper(url: URL) {
+    let asset = AVURLAsset(url: url)
+    let template = AVPlayerItem(asset: asset)
+    let queue = AVQueuePlayer()
+    queue.volume = Float(volume)
+    // Keep the player clock advancing through brief decode stalls; the renderer holds its last frame.
+    queue.automaticallyWaitsToMinimizeStalling = false
 
     self.playerItem = template
     self.videoOutput = nil
-    self.boomerangForwardLen = built.forwardLenSec
-    // No deferred play to consume — the KVO below owns the resume.
-    pendingPlay = false
+    self.player = queue
+    startFramePull()
+
+    delegate?.videoSource(self, didChangeStatus: "loading")
+
+    // Watchdog: iOS can pause the player mid-clip (audio session, decoder scheduling). The
+    // looper owns position and looping, so never seek from here — just nudge the rate back.
+    timeControlObserver = queue.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+      guard let self, player === self.player else { return }
+      if player.timeControlStatus == .paused && self.shouldAutoPlay && !self.pendingPlay
+        && !self.seekInProgress && !self.isInBackground && player.rate == 0
+      {
+        player.rate = self.desiredRate
+      }
+    }
 
     // Re-attach a fresh video output whenever the looper advances to a new current item, and
     // (re)apply the rate there too. The looper populates the queue ASYNCHRONOUSLY, so a rate
@@ -423,29 +305,42 @@ final class VideoSource: NSObject {
     // `hasNewPixelBuffer` and freezes the render loop on its last decoded frame.
     currentItemObserver = queue.observe(\.currentItem, options: [.initial, .new]) {
       [weak self] q, _ in
-      guard let self else { return }
-      guard let current = q.currentItem, current !== outgoingItem else { return }
+      guard let self, let current = q.currentItem else { return }
       self.attachOutput(to: current)
-      if self.shouldAutoPlay {
-        if q.rate == 0 {
-          q.rate = self.desiredRate
-          self.lastPlaybackStartTime = CACurrentMediaTime()
-        }
-        self.delegate?.videoSource(self, didChangeStatus: "playing")
-      } else {
-        self.delegate?.videoSource(self, didChangeStatus: "ready")
+      if self.statusObservedItem == nil {
+        // First cycled item: its status KVO drives the plain-load readyToPlay flow
+        // (deferred clip-start seek, pendingPlay resume, "ready"/"error" reporting).
+        // `.initial` because the item may already be readyToPlay when it becomes current.
+        current.addObserver(self, forKeyPath: "status", options: [.new, .initial], context: nil)
+        self.statusObservedItem = current
+      } else if self.shouldAutoPlay && !self.pendingPlay && !self.seekInProgress && q.rate == 0 {
+        // Later cycles reuse already-primed copies: no status dance, just make sure the
+        // rate survives the item transition.
+        q.rate = self.desiredRate
+        self.lastPlaybackStartTime = CACurrentMediaTime()
       }
     }
 
-    // Installing the looper replaces the queue contents (template + a buffered copy) and loops
-    // them gaplessly. actionAtItemEnd is managed by the looper from here on.
-    boomerangLooper = AVPlayerLooper(player: queue, templateItem: template)
-    self.boomerangActive = true
+    // Installing the looper populates the queue (copies of the template) and loops them
+    // gaplessly; actionAtItemEnd is managed by the looper from here on.
+    let looper = AVPlayerLooper(player: queue, templateItem: template)
+    self.looper = looper
+    looperStatusObserver = looper.observe(\.status, options: [.new]) { [weak self] looper, _ in
+      guard let self else { return }
+      if looper.status == .failed {
+        self.delegate?.videoSource(self, didChangeStatus: "error")
+      }
+    }
+  }
 
-    // Don't seek to forwardSec: an exact-frame seek on the fresh composition decoder takes
-    // 1-3 frames to complete and causes a visible stall. The composition restarts from the
-    // beginning (which matches the forward clip's start content), so the slight position
-    // reset is imperceptible.
+  /// End-of-clip handler for `'off'` mode (loop mode installs no end observer — a looped
+  /// clip never "plays to end"). The terminal state is exposed through the transport
+  /// snapshot.
+  private func handleItemDidPlayToEnd(_ note: Notification) {
+    guard let endedItem = note.object as? AVPlayerItem, endedItem === player?.currentItem else {
+      return
+    }
+    delegate?.videoSourceDidPlayToEnd(self)
   }
 
   /// Attach a fresh `AVPlayerItemVideoOutput` to `item` and point `self.videoOutput` at it, so
@@ -454,7 +349,7 @@ final class VideoSource: NSObject {
   /// it on revisits (re-adding the same output to an item it already has is invalid).
   private func attachOutput(to item: AVPlayerItem?) {
     guard let item else { return }
-    if let existing = boomerangOutputsByItem.object(forKey: item) {
+    if let existing = outputsByLoopedItem.object(forKey: item) {
       videoOutput = existing
       playerItem = item
       return
@@ -466,14 +361,14 @@ final class VideoSource: NSObject {
     #endif
     output.requestNotificationOfMediaDataChange(withAdvanceInterval: 1.0 / 30.0)
     item.add(output)
-    boomerangOutputsByItem.setObject(output, forKey: item)
+    outputsByLoopedItem.setObject(output, forKey: item)
     videoOutput = output
     playerItem = item
   }
 
   /// Tracks the video output attached to each looper-cycled item (weak keys so recycled items
   /// release naturally) — prevents re-adding an output to an item that already has one.
-  private let boomerangOutputsByItem = NSMapTable<AVPlayerItem, AVPlayerItemVideoOutput>(
+  private let outputsByLoopedItem = NSMapTable<AVPlayerItem, AVPlayerItemVideoOutput>(
     keyOptions: .weakMemory, valueOptions: .strongMemory)
 
   private var pendingPlay = false
@@ -660,7 +555,7 @@ final class VideoSource: NSObject {
   private let bufferLock = NSLock()
   private var latestBuffer: CVPixelBuffer?
   private var latestBufferIsNew = false
-  /// Forward media time of `latestBuffer`, captured at deposit from the same item time the
+  /// Media time of `latestBuffer`, captured at deposit from the same item time the
   /// pull used to fetch it. Guarded by `bufferLock` with the buffer it describes.
   private var latestPtsSec: Double = -1
   private var clipGeneration: Int64 = 0
@@ -675,8 +570,8 @@ final class VideoSource: NSObject {
   /// hop) raced, and which frame won depended on thread scheduling.
   struct DecodedFrame {
     let buffer: CVPixelBuffer
-    /// Forward media time, i.e. already through `forwardMediaTime` so boomerang reverse
-    /// playback still reports the public forward timeline the trackers are authored against.
+    /// Media time of this frame on the item's own timeline. In `'loop'` mode each looper
+    /// cycle plays a fresh copy starting at 0, so this sawtooths 0→L→0.
     let ptsSec: Double
     let generation: Int64
   }
@@ -727,9 +622,8 @@ final class VideoSource: NSObject {
     latestBuffer = pb
     latestBufferIsNew = true
     // `time` is the item time this very buffer was fetched for, so it is the frame's own
-    // presentation time rather than a later sample of the player clock. Remapped to the
-    // public forward timeline for boomerang parity with `currentTimeSec`.
-    latestPtsSec = forwardMediaTime(time.seconds)
+    // presentation time rather than a later sample of the player clock.
+    latestPtsSec = time.seconds
     bufferLock.unlock()
   }
 
@@ -795,17 +689,14 @@ final class VideoSource: NSObject {
     releaseDeferredSeekHold()
     lastPlaybackStartTime = 0
     clearLatestBuffer()
-    // Drop any boomerang composition state; a fresh build is kicked off per loadUri.
-    // Invalidate in-flight builds so a late completion can't swap onto the next clip.
-    boomerangBuildToken &+= 1
-    boomerangActive = false
-    boomerangForwardLen = 0
     // Tear down the gapless looper + its current-item KVO before dropping the player.
-    boomerangLooper?.disableLooping()
-    boomerangLooper = nil
+    looper?.disableLooping()
+    looper = nil
+    looperStatusObserver?.invalidate()
+    looperStatusObserver = nil
     currentItemObserver?.invalidate()
     currentItemObserver = nil
-    boomerangOutputsByItem.removeAllObjects()
+    outputsByLoopedItem.removeAllObjects()
     if let obs = endObserver {
       NotificationCenter.default.removeObserver(obs)
       endObserver = nil
@@ -813,8 +704,8 @@ final class VideoSource: NSObject {
     timeControlObserver?.invalidate()
     timeControlObserver = nil
     // Remove the status observer from the EXACT item it's registered on (the forward item or
-    // the boomerang template) — NOT `playerItem`, which `attachOutput` may have reassigned to a
-    // looper-cycled copy that was never observed (removing from it would throw and crash).
+    // the first looper-cycled item) — NOT `playerItem`, which `attachOutput` may have reassigned
+    // to a looper-cycled copy that was never observed (removing from it would throw and crash).
     if let observed = statusObservedItem {
       observed.removeObserver(self, forKeyPath: "status")
       statusObservedItem = nil

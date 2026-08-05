@@ -22,17 +22,22 @@ Mirrors `ios/` behavior with Android-native plumbing. Same TS contract (`src/Vid
   latch. Worklet acquires never cross JNI; Kotlin pushes via
   `FrameSourceNative` (plain JNI, `VideoTextureJNI.cpp`). Handles flow to JS as bigints for
   `RNWebGPU.createVideoFrameFromNativeBuffer()`.
-- **Boomerang** — `BoomerangComposition.kt`: reversed file pre-rendered GOP-by-GOP with
-  MediaCodec (frames spooled to a cache raw file, ~2 frames of RAM regardless of GOP size),
-  forward audio muxed in compressed. Playback is a two-item playlist `[original, reversed]` +
-  `REPEAT_MODE_ALL` — video fwd/rev/fwd…, audio always forward. `currentTimeSec` reports true
-  forward media time (item 0 = position; item 1 = L − position). Cached in `cacheDir` keyed by
-  URI hash; `prebuildBoomerang` warms it. The reversed leg renders at **source resolution** —
-  this keeps image quality consistent at every turnaround. Peak RAM is unaffected (~2 frames),
-  but peak *disk* is one GOP of raw I420
-  (≈12 MB/frame at 2160p), released when the render finishes. The cache filename carries a
-  format version (`boomerang-rev-v2-…`); bump it when the output format changes, or devices
-  keep serving stale files.
+- **Boomerang writer** — `BoomerangWriter.kt`: one-shot `makeBoomerang` render, decoupled from
+  playback. Two passes through ONE MediaCodec encoder (`MediaMuxer` allows a single
+  `addTrack`/SPS-PPS per track, so both legs must be re-encoded): pass 1 emits frames
+  `0..N-1` forward, pass 2 walks GOPs last→first and emits `N-2..1` — both duplicate
+  endpoint frames dropped by a global index guard, so neither the turnaround nor the loop
+  seam holds a frame. Each GOP is spooled to a raw file (~2 frames of RAM regardless of GOP
+  size; peak *disk* is one GOP of raw I420, ≈12 MB/frame at 2160p, deleted when done).
+  Forward audio is muxed in compressed, twice, trimmed to the video length. Renders at
+  **source resolution + source bitrate** to keep the second-generation forward encode
+  honest. Throws on any failure; output is written to `.tmp` then renamed.
+- **Seamless loop** — `loopMode: 'loop'` loads TWO identical `MediaItem`s +
+  `REPEAT_MODE_ALL`: ExoPlayer prewarms the next playlist period, so the wrap is gapless
+  (`REPEAT_MODE_ONE` resets the renderer and can hitch). `startSec` applies to the first
+  cycle only — the loop always wraps to 0, matching the baked file's frame(last)→frame(0)
+  seam. `currentPosition` is per-item, so reported time is already the 0→L sawtooth;
+  `'ended'` never fires.
 - **Requirements** — a physical device, API 29+ (`ImageReader` usage-flags overload).
   `frameSource.pixelFormat` reports `'bgra8'` (frames are RGBA after the bridge); `'nv12'` is
   accepted at construction as the legacy request alias. Rotated video is rejected at load.

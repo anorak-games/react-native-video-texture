@@ -6,7 +6,7 @@
  */
 export { VIDEO_TEXTURE_DEVICE_FEATURES } from './deviceFeatures';
 export { isVideoTextureSupported } from './nativeModule';
-export { prebuildBoomerang } from './prebuildBoomerang';
+export { makeBoomerang } from './makeBoomerang';
 export { useVideoTexture, type VideoTexture } from './useVideoTexture';
 export { createVideoTexturePlayer, getFrameSource } from './VideoPlayer';
 export type {
