@@ -1,6 +1,6 @@
 {
   "name": "@anorak-games/react-native-video-texture",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Headless Expo video player that exposes decoded frames as WebGPU-compatible native textures.",
   "main": "build/index.js",
   "types": "build/index.d.ts",
