@@ -1,6 +1,5 @@
 package expo.modules.videotexture
 
-import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 
@@ -18,25 +17,6 @@ class VideoTextureModule : Module() {
 
   override fun definition() = ModuleDefinition {
     Name("VideoTexture")
-
-    // One-shot boomerang render: inputUri → [fwd][rev] file at outputPath (overwritten).
-    // Resolves with outputPath; rejects with a message on any failure — callers must not
-    // fall back silently, this simulates the eventual server-side pre-bake job.
-    AsyncFunction("makeBoomerang") { inputUri: String, outputPath: String, promise: Promise ->
-      val context = appContext.reactContext
-      if (context == null) {
-        promise.reject("ERR_MAKE_BOOMERANG", "makeBoomerang: React context unavailable", null)
-        return@AsyncFunction
-      }
-      Thread({
-        try {
-          BoomerangWriter.writeSync(context, inputUri, outputPath)
-          promise.resolve(outputPath)
-        } catch (t: Throwable) {
-          promise.reject("ERR_MAKE_BOOMERANG", t.message ?: "makeBoomerang failed", t)
-        }
-      }, "videotexture.makeBoomerang").start()
-    }
 
     OnActivityEntersBackground {
       players.forEach { it.onBackground() }

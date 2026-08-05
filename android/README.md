@@ -22,16 +22,6 @@ Mirrors `ios/` behavior with Android-native plumbing. Same TS contract (`src/Vid
   latch. Worklet acquires never cross JNI; Kotlin pushes via
   `FrameSourceNative` (plain JNI, `VideoTextureJNI.cpp`). Handles flow to JS as bigints for
   `RNWebGPU.createVideoFrameFromNativeBuffer()`.
-- **Boomerang writer** — `BoomerangWriter.kt`: one-shot `makeBoomerang` render, decoupled from
-  playback. Two passes through ONE MediaCodec encoder (`MediaMuxer` allows a single
-  `addTrack`/SPS-PPS per track, so both legs must be re-encoded): pass 1 emits frames
-  `0..N-1` forward, pass 2 walks GOPs last→first and emits `N-2..1` — both duplicate
-  endpoint frames dropped by a global index guard, so neither the turnaround nor the loop
-  seam holds a frame. Each GOP is spooled to a raw file (~2 frames of RAM regardless of GOP
-  size; peak *disk* is one GOP of raw I420, ≈12 MB/frame at 2160p, deleted when done).
-  Forward audio is muxed in compressed, twice, trimmed to the video length. Renders at
-  **source resolution + source bitrate** to keep the second-generation forward encode
-  honest. Throws on any failure; output is written to `.tmp` then renamed.
 - **Seamless loop** — `loopMode: 'loop'` loads TWO identical `MediaItem`s +
   `REPEAT_MODE_ALL`: ExoPlayer prewarms the next playlist period, so the wrap is gapless
   (`REPEAT_MODE_ONE` resets the renderer and can hitch). `startSec` applies to the first
