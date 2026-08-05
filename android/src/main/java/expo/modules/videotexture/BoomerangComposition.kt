@@ -182,6 +182,17 @@ object BoomerangComposition {
       encFormat.setInteger(MediaFormat.KEY_BIT_RATE, srcBitRate)
       encFormat.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
       encFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+      // Stamp explicit color aspects into the bitstream VUI. Sources recorded
+      // by the app declare none (coded.vui.color.* = 0), which leaves decoders
+      // guessing the matrix — Samsung guesses BT.2020 for un-tagged 4K SDR.
+      // Copy from the source when it declares aspects, else pin SDR BT.709.
+      fun copyColorAspect(key: String, default: Int) {
+        val value = if (videoFormat.containsKey(key)) videoFormat.getInteger(key) else default
+        encFormat.setInteger(key, value)
+      }
+      copyColorAspect(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+      copyColorAspect(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+      copyColorAspect(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
       val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         .also { encoderToRelease = it }
       encoder.configure(encFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)

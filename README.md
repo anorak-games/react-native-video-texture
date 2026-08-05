@@ -33,9 +33,12 @@ Set the consuming app's `postinstall` script to:
 ```
 
 The patch is tied to `react-native-webgpu@0.8.1`. It releases the native external texture
-and source frame when `GPUExternalTexture.destroy()` is called, allowing the decoder buffer
-to return to its producer immediately. Remove the patch only after the fix is available in
-the installed upstream version.
+and source frame when `GPUExternalTexture.destroy()` is called (so the frame buffer returns
+to its producer immediately), surfaces native error messages to JS instead of
+`Exception in HostFunction: <unknown>`, acquires shared textures with a content-preserving
+image layout, and logs the driver-reported import properties once per process
+(`[huntVideoColor]` tag) for colour debugging. `patches/dawn/` is reference material for
+upstream Dawn reports and is not applied to anything.
 
 Apps using Expo prebuild should set the native minimum versions explicitly:
 
@@ -84,8 +87,12 @@ is safe on web, but creating a player is not supported there.
 
 ## Platform notes
 
-- Android supports only the `nv12` pixel format and rejects rotated video.
-- Android YUV samples must be multiplied by `GPUExternalTexture.yuvToRgbMatrix` in the shader.
+- Samples arrive as RGB on both platforms — Android converts decoder frames to RGBA8 on the
+  GPU (`GlVideoBridge`, one blit per frame), iOS converts in Dawn's Metal sampler — so shaders
+  need **no** colour conversion and no platform branches. `GPUExternalTexture.yuvToRgbMatrix`
+  is the identity for every frame this module produces.
+- Android reports `pixelFormat: 'bgra8'` (`'nv12'` is accepted at construction as a legacy
+  alias) and rejects rotated video.
 - Keep the external video texture and its sampler in bind group 0; place other resources in
   later bind groups.
 - Boomerang playback writes a reversed composition into the app cache. At 2160p, temporary

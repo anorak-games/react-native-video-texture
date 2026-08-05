@@ -1,7 +1,7 @@
 package expo.modules.videotexture
 
 import android.content.Context
-import android.graphics.ImageFormat
+import android.graphics.PixelFormat
 import android.hardware.HardwareBuffer
 import android.media.Image
 import android.media.ImageReader
@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -47,13 +48,23 @@ class VideoSource(
 
   private var player: ExoPlayer? = null
   private var imageReader: ImageReader? = null
+  private var glBridge: GlVideoBridge? = null
   private var readerWidth = 0
   private var readerHeight = 0
 
-  // 2-deep Image hold: closing an Image returns its BufferQueue slot to the
-  // producer, which may rewrite content — keep the consumer window covered.
-  private var latestImage: Image? = null
-  private var prevImage: Image? = null
+  private data class RetainedImage(
+    val image: Image,
+    val reader: ImageReader,
+  )
+
+  private data class RetiredReader(
+    val reader: ImageReader,
+    val thread: HandlerThread,
+    val bridge: GlVideoBridge,
+  )
+
+  private val retainedImages = mutableMapOf<Long, RetainedImage>()
+  private val retiredReaders = mutableMapOf<ImageReader, RetiredReader>()
   private var frameFailurePending = false
 
   private var currentUri: String? = null
@@ -262,6 +273,7 @@ class VideoSource(
     loadGeneration += 1
     probeExecutor.shutdownNow()
     teardown()
+    releaseAllFrames()
   }
 
   // MARK: - Player / reader plumbing
@@ -332,8 +344,9 @@ class VideoSource(
     p.setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).build(), false)
     p.volume = volume.toFloat()
     p.addListener(playerListener)
-    val reader = requireNotNull(imageReader) { "VideoTexture: reader must exist before player" }
-    p.setVideoSurface(reader.surface)
+    requireNotNull(imageReader) { "VideoTexture: reader must exist before player" }
+    val bridge = requireNotNull(glBridge) { "VideoTexture: bridge must exist before player" }
+    p.setVideoSurface(bridge.inputSurface)
     player = p
     mainHandler.removeCallbacks(timeTicker)
     mainHandler.post(timeTicker)
@@ -344,26 +357,57 @@ class VideoSource(
     if (imageReader != null && readerWidth == width && readerHeight == height) {
       return
     }
-    closeReader()
     val thread = HandlerThread("videotexture.frames").also { it.start() }
-    frameThread = thread
-    frameHandler = Handler(thread.looper)
-
+    val handler = Handler(thread.looper)
+    // RGBA_8888, not the decoder's own format: frames reach this reader
+    // through GlVideoBridge, which converts the decoder's vendor YUV layout to
+    // plain RGBA on the GPU. RGBA8 AHardwareBuffers import into WebGPU through
+    // Dawn's ordinary color path on every GPU vendor — no external formats, no
+    // YCbCr conversions (see GlVideoBridge for why the direct import is not
+    // viable).
     val reader = ImageReader.newInstance(
       width,
       height,
-      ImageFormat.PRIVATE,
+      PixelFormat.RGBA_8888,
       MAX_IMAGES,
       HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
     )
+    val bridge = GlVideoBridge(width, height, reader.surface, handler) { message ->
+      Log.e(TAG, message)
+      postFrameFailure(reader)
+    }
+
+    var previousReader: ImageReader? = null
+    var previousThread: HandlerThread? = null
+    var previousBridge: GlVideoBridge? = null
     synchronized(frameDeliveryLock) {
+      previousReader = imageReader
+      previousThread = frameThread
+      previousBridge = glBridge
+      frameFailurePending = false
       readerWidth = width
       readerHeight = height
       imageReader = reader
+      glBridge = bridge
+      frameThread = thread
+      frameHandler = handler
+      if (previousReader != null && previousThread != null && previousBridge != null) {
+        retiredReaders[requireNotNull(previousReader)] = RetiredReader(
+          requireNotNull(previousReader),
+          requireNotNull(previousThread),
+          requireNotNull(previousBridge),
+        )
+      }
     }
-    reader.setOnImageAvailableListener(::onImageAvailable, frameHandler)
-    // A live player must switch to the new reader's surface.
-    player?.setVideoSurface(reader.surface)
+    previousReader?.setOnImageAvailableListener(null, null)
+    reader.setOnImageAvailableListener(::onImageAvailable, handler)
+    try {
+      player?.setVideoSurface(bridge.inputSurface)
+    } finally {
+      synchronized(frameDeliveryLock) {
+        previousReader?.let(::closeRetiredReaderIfUnused)
+      }
+    }
   }
 
   private fun onImageAvailable(reader: ImageReader) {
@@ -396,15 +440,14 @@ class VideoSource(
         // ticker interval (~16ms) stale, unlike iOS where the exact item time is available at
         // the pull; still far better than the previous native -> JS -> worklet round trip,
         // and crucially it is now attached to the frame rather than racing it.
-        FrameSourceNative.nativePushFrame(
+        val handle = FrameSourceNative.nativePushFrame(
           providerPtr,
           hardwareBuffer,
           currentTime,
           clipGeneration,
         )
-        prevImage?.close()
-        prevImage = latestImage
-        latestImage = image
+        check(handle != 0L)
+        retainedImages[handle] = RetainedImage(image, reader)
         accepted = true
       } catch (_: Exception) {
         postFrameFailure(reader)
@@ -434,21 +477,55 @@ class VideoSource(
   private fun closeReader() {
     val reader = synchronized(frameDeliveryLock) {
       val reader = imageReader
+      val thread = frameThread
+      val bridge = glBridge
       imageReader = null
-      latestImage?.close()
-      latestImage = null
-      prevImage?.close()
-      prevImage = null
+      glBridge = null
+      if (reader != null && thread != null && bridge != null) {
+        retiredReaders[reader] = RetiredReader(reader, thread, bridge)
+      }
       frameFailurePending = false
       readerWidth = 0
       readerHeight = 0
       reader
     }
     reader?.setOnImageAvailableListener(null, null)
-    reader?.close()
-    frameThread?.quitSafely()
+    synchronized(frameDeliveryLock) {
+      reader?.let(::closeRetiredReaderIfUnused)
+    }
     frameThread = null
     frameHandler = null
+  }
+
+  fun releaseFrame(handle: Long) {
+    synchronized(frameDeliveryLock) {
+      val retained = retainedImages.remove(handle) ?: return
+      retained.image.close()
+      closeRetiredReaderIfUnused(retained.reader)
+    }
+  }
+
+  private fun closeRetiredReaderIfUnused(reader: ImageReader) {
+    if (retainedImages.values.any { it.reader === reader }) return
+    val retired = retiredReaders.remove(reader) ?: return
+    // The bridge posts its EGL teardown to the frames thread, so release it
+    // before that thread is asked to quit; quitSafely drains posted work.
+    retired.bridge.release()
+    retired.reader.close()
+    retired.thread.quitSafely()
+  }
+
+  private fun releaseAllFrames() {
+    synchronized(frameDeliveryLock) {
+      retainedImages.values.forEach { it.image.close() }
+      retainedImages.clear()
+      retiredReaders.values.forEach {
+        it.bridge.release()
+        it.reader.close()
+        it.thread.quitSafely()
+      }
+      retiredReaders.clear()
+    }
   }
 
   private fun teardown() {
@@ -501,8 +578,8 @@ class VideoSource(
   }
 
   companion object {
-    // Small pool: 2 held by the consumer window, 3 free for the decoder.
     private const val MAX_IMAGES = 5
+    private const val TAG = "VideoTexture"
 
     /// ranchu/goldfish = the Android emulator (gfxstream graphics). Unsupported: gfxstream
     /// can neither Vulkan-import the codec's YUV gralloc buffers (tight NV12 allocation vs
@@ -512,4 +589,5 @@ class VideoSource(
     val IS_EMULATOR: Boolean =
       android.os.Build.HARDWARE == "ranchu" || android.os.Build.HARDWARE == "goldfish"
   }
+
 }

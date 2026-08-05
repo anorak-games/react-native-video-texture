@@ -22,7 +22,7 @@ object FrameSourceNative {
     hardwareBuffer: HardwareBuffer,
     ptsSec: Double,
     generation: Long,
-  )
+  ): Long
   external fun nativeClearLatest(providerPtr: Long)
   external fun nativeUpdateTransport(
     providerPtr: Long,

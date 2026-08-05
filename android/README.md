@@ -3,11 +3,20 @@
 Mirrors `ios/` behavior with Android-native plumbing. Same TS contract (`src/VideoPlayer.ts`).
 
 - **Decoder/transport** — `VideoSource.kt`: one ExoPlayer (media3) on the main looper renders
-  video into an `ImageReader` (`PRIVATE`, `USAGE_GPU_SAMPLED_IMAGE`, pool of 5), so each decoded
-  frame arrives as an `AHardwareBuffer`. Push model (`onImageAvailable` → JNI), no polling.
+  video into `GlVideoBridge`'s `SurfaceTexture`; the bridge blits each frame to RGBA on the GPU
+  into an `ImageReader` (`RGBA_8888`, `USAGE_GPU_SAMPLED_IMAGE`, pool of 5), so each frame
+  arrives as a plain RGBA8 `AHardwareBuffer`. Push model (`onImageAvailable` → JNI), no polling.
   `setMediaItem(item, startPositionMs)` is the authoritative generation-bound clip start
-  (subsumes iOS's deferred-seek + preroll). The last two `Image`s stay open as a
-  producer-rewrite guard; the C++ +1 ref covers memory lifetime.
+  (subsumes iOS's deferred-seek + preroll). Each `Image` stays acquired until the consumer
+  calls `releaseFrame` after its GPU work completes, preventing the decoder from rewriting a
+  buffer while WebGPU is still using it.
+- **GL bridge** — `GlVideoBridge.kt`: decoders hand out vendor-specific YUV gralloc layouts
+  (Exynos SBWC/SP_M, Qualcomm UBWC, Tensor SPN) whose Vulkan import is driver roulette —
+  Samsung Xclipse cannot sample their chroma planes through that path at all (S22 renders
+  green, S24 teal; see `patches/dawn/README.md` for the full investigation). The one path every
+  vendor certifies is GL's external texture, so the bridge samples the decoder frame there and
+  writes RGBA. Cost: one fullscreen quad per frame (<1 ms GPU, no CPU copies). RGBA8 buffers
+  import through Dawn's ordinary color path on every GPU — no external formats, no YCbCr.
 - **Frame source** — shared `../cpp/FrameSourceHostObject.{h,cpp}` (same JSI HostObject as iOS)
   bound to `AndroidFrameProvider` (`src/main/cpp/`): a mutex-guarded latest-AHardwareBuffer
   latch. Worklet acquires never cross JNI; Kotlin pushes via
@@ -24,24 +33,19 @@ Mirrors `ios/` behavior with Android-native plumbing. Same TS contract (`src/Vid
   (≈12 MB/frame at 2160p), released when the render finishes. The cache filename carries a
   format version (`boomerang-rev-v2-…`); bump it when the output format changes, or devices
   keep serving stale files.
-- **Requirements** — a physical device, API 29+ (`ImageReader` usage-flags overload);
-  `pixelFormat` must be `'nv12'` (Android decoders yield YCbCr AHardwareBuffers; no BGRA
-  path). Rotated video is rejected at load.
-- **WebGPU side** — the app must request `ycbcr-vulkan-samplers` and
-  `opaque-ycbcr-android-for-external-texture` in `requestDevice`, and its shader must apply
-  `GPUExternalTexture.yuvToRgbMatrix` after sampling. Dawn imports YUV AHardwareBuffers as
-  `OpaqueYCbCrAndroid` and samples them through a Vulkan conversion hard-coded to
-  `RGB_IDENTITY`, so the sample arrives as raw `[Y, Cb, Cr]` and the model conversion is the
-  consumer's job; react-native-webgpu derives the matrix from the driver's suggested model
-  and range per buffer and exposes it on the imported texture. It is the identity passthrough
-  on iOS, so a shader can multiply unconditionally.
+- **Requirements** — a physical device, API 29+ (`ImageReader` usage-flags overload).
+  `frameSource.pixelFormat` reports `'bgra8'` (frames are RGBA after the bridge); `'nv12'` is
+  accepted at construction as the legacy request alias. Rotated video is rejected at load.
+- **WebGPU side** — samples arrive as RGB on both platforms (Android converts in the GL
+  bridge; iOS converts in Dawn's Metal sampler), so shaders apply **no** colour conversion.
+  `GPUExternalTexture.yuvToRgbMatrix` is still exposed and is the identity for every frame this
+  module produces — consumers can assert on it as a divergence check.
 - **Bind group 0 is reserved for the video** — put the `texture_external` and its sampler
-  there and nothing else; every other resource goes in group 1. Dawn imports the frame as an
-  opaque YCbCr image sampled through an immutable-conversion sampler, and Tint expands
+  there and nothing else; every other resource goes in group 1. Tint expands
   `texture_external` into several internal bindings packed into that same descriptor set;
   resources sharing it can read back as zero. This can be confirmed with a static texture that
   no render pass writes: the failure follows the shared descriptor set rather than the contents.
-- **No emulator support** — the emulator (gfxstream) can neither Vulkan-import the codec's
-  YUV gralloc buffers (tight NV12 allocation vs padded host requirement) nor report a usable
-  AHardwareBuffer `allocationSize`, so Dawn's shared-texture-memory validation rejects every
-  frame. `VideoTexturePlayer` refuses to construct on ranchu/goldfish with a clear message.
+- **No emulator support** — kept from the direct-import era, when gfxstream could not
+  Vulkan-import the codec's YUV gralloc buffers. The RGBA bridge may well work there now, but
+  it has not been validated, so `VideoTexturePlayer` still refuses to construct on
+  ranchu/goldfish with a clear message.
