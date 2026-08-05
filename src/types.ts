@@ -105,11 +105,6 @@ export declare class VideoTexturePlayer extends SharedObject {
 /** Shape of the `VideoTexture` Expo module as exposed to JS. */
 export interface VideoTextureNativeModule {
     readonly VideoTexturePlayer: typeof VideoTexturePlayer;
-    /**
-     * One-shot boomerang render: `inputUri` → `[fwd][rev]` file at `outputPath`.
-     * Resolves with `outputPath`; rejects with a message on any failure.
-     */
-    makeBoomerang: (inputUri: string, outputPath: string) => Promise<string>;
 }
 
 /**

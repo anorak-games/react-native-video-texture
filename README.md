@@ -95,14 +95,6 @@ is safe on web, but creating a player is not supported there.
   alias) and rejects rotated video.
 - Keep the external video texture and its sampler in bind group 0; place other resources in
   later bind groups.
-- `makeBoomerang(inputUri, outputPath)` is a one-shot offline render (video in → seamlessly
-  loopable `[forward][reverse]` video out, forward audio twice) that simulates the eventual
-  server-side pre-bake. It costs ~2× decode + 1× encode of the clip, so run it during a
-  loading phase — never during playback — and play the result with `loopMode: 'loop'`. The
-  caller owns `outputPath` (existing files are overwritten); the promise rejects on any
-  failure. On Android, temporary disk usage while rendering can reach roughly 12 MB per
-  frame for one GOP at 2160p.
-
 ## Development
 
 ```sh

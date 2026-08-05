@@ -183,8 +183,7 @@ class VideoSource(
           if (loopMode == "loop") {
             // Seamless loop: TWO identical items + REPEAT_MODE_ALL, not REPEAT_MODE_ONE.
             // ExoPlayer prewarms the next playlist period, so the item transition is
-            // genuinely gapless (the same mechanism the old boomerang turnaround relied
-            // on); REPEAT_MODE_ONE resets the renderer at the wrap and can hitch.
+            // genuinely gapless; REPEAT_MODE_ONE resets the renderer at the wrap and can hitch.
             // startSec applies to the FIRST cycle only: the loop must wrap to 0 because
             // a pre-baked loop file's seam is frame(last)→frame(0).
             p.setMediaItems(listOf(item, item), 0, (startSec * 1000).toLong())
