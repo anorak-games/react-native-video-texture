@@ -12,10 +12,11 @@ export type VideoPlayerStatus = 'idle' | 'loading' | 'ready' | 'playing' | 'ende
 
 /**
  * Transport loop mode.
- * - `'off'` (default): the clip plays once and settles at status `'ended'`.
- * - `'loop'`: native loops the clip seamlessly (no wrap-around hitch). `startSec` applies
- *   to the first cycle only; every wrap restarts at 0 — a pre-baked loop file's seam is
- *   frame(last)→frame(0). Status `'ended'` never fires.
+ * - `'off'` (default): the clip region plays once and settles at status `'ended'` — at
+ *   `endSec` when one is set, otherwise at the end of the file.
+ * - `'loop'`: native loops the clip region seamlessly (no wrap-around hitch). Without an
+ *   `endSec` the whole file loops and every wrap restarts at 0; with a region the wrap is
+ *   frame(endSec−1)→frame(startSec). Status `'ended'` never fires.
  */
 export type VideoLoopMode = 'off' | 'loop';
 
@@ -25,6 +26,13 @@ export interface LoadClipOptions {
     uri: string;
     /** Authoritative clip-start second, applied once per generation. */
     startSec?: number;
+    /**
+     * Absolute file time (seconds) bounding the playable region. `'off'`: status `'ended'`
+     * settles here instead of at file end. `'loop'`: the [startSec, endSec] region loops
+     * seamlessly. Omitted / <= 0 = no bound (whole file). Timestamps stay ABSOLUTE file
+     * time in both modes — `ptsSec` sawtooths startSec→endSec under a region loop.
+     */
+    endSec?: number;
     /** Bump to re-arm the clip start on an otherwise-identical load. */
     generation: number;
     loopMode?: VideoLoopMode;
@@ -47,8 +55,9 @@ export interface VideoFrame {
      */
     handle: bigint;
     /**
-     * Media time of THIS frame, in seconds. Negative when unknown. In `'loop'` mode it
-     * sawtooths 0→duration→0, one rise per cycle.
+     * Media time of THIS frame, in seconds — always ABSOLUTE file time. Negative when
+     * unknown. In `'loop'` mode it sawtooths startSec→endSec (0→duration without a
+     * region), one rise per cycle.
      *
      * Exact on iOS (the item time the buffer was fetched for). On Android it is the 60Hz
      * player-position snapshot extrapolated by wall clock, so up to ~16ms stale: ExoPlayer

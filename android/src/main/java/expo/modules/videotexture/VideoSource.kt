@@ -19,6 +19,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.PlayerMessage
 import androidx.media3.exoplayer.SeekParameters
 import java.util.concurrent.Executors
 import kotlin.math.max
@@ -76,7 +77,38 @@ class VideoSource(
   private var installedLoopMode = "off"
   private var desiredRate = 1.0
   private var armedClipStartSec: Double? = null
-  private var endedReported = false
+  private var armedClipEndSec: Double? = null
+  /// Absolute-file-time bound of the playable region; <= 0 = none. `'off'` mode enforces it
+  /// with an exact PlayerMessage at the bound (full item, absolute positions — no clipping,
+  /// so the hot same-URI segment swap stays a pure seek). `'loop'` mode enforces it with
+  /// MediaItem.ClippingConfiguration (see loadUri).
+  private var clipEndSec: Double = -1.0
+  /// Under a loop-region ClippingConfiguration ExoPlayer reports CLIP-RELATIVE positions;
+  /// this offset (= region start) translates them back to absolute file time for
+  /// `currentTime` / frame stamping, and is subtracted from absolute `seek` targets.
+  /// 0 outside loop-region mode.
+  private var clipOffsetSec = 0.0
+  /// Exact end-of-region trigger for `'off'` mode. deleteAfterDelivery=false so a backwards
+  /// seek re-arms it naturally; cancelled on load/teardown.
+  private var endMessage: PlayerMessage? = null
+  /// The region the current loop playlist was clipped to (whole file = (0, -1)); a
+  /// loop-region change needs a fresh playlist, unlike an 'off'-region change.
+  private var installedLoopStartSec = 0.0
+  private var installedLoopEndSec = -1.0
+  /// The `'off'`-mode region bound the frame gate is armed at; -1 = no gate (loop mode
+  /// enforces its region natively via ClippingConfiguration). Read on the playback thread
+  /// by the VideoFrameMetadataListener installed in `ensurePlayer`.
+  @Volatile private var offModeEndGateSec = -1.0
+  /// Closed (true) when the frame about to be rendered is AT or PAST the region bound —
+  /// in a baked file that frame is the NEXT segment's (segments are [start, end), so the
+  /// boundary frame at endSec is already the next clip's IDR). The end PlayerMessage +
+  /// pause land asynchronously (main-looper delivery, then a hop back to the playback
+  /// thread), so such frames DO get rendered; the ImageReader deposit drops them while
+  /// this is closed and the renderer holds the last in-region frame. Driven by each
+  /// frame's own EXACT media pts — extrapolated position stamps carry ~16ms of jitter,
+  /// which cannot separate two frames one frame-interval apart.
+  @Volatile private var frameGateClosed = false
+  @Volatile private var endedReported = false
   @Volatile private var loadGeneration = 0
   // Written by the main thread and stamped onto frames from the ImageReader thread.
   @Volatile private var clipGeneration = 0L
@@ -131,6 +163,11 @@ class VideoSource(
     armedClipStartSec = sec
   }
 
+  /// Armed together with `armClipStart` (once per clip generation), before `loadUri`.
+  fun armClipEnd(sec: Double) {
+    armedClipEndSec = if (sec > 0) sec else -1.0
+  }
+
   fun setClipGeneration(generation: Long) {
     clipGeneration = generation
   }
@@ -143,21 +180,47 @@ class VideoSource(
       delegate?.onStatusChange("idle")
       return
     }
-    if (uri == currentUri && player != null && loopMode == installedLoopMode) {
-      // Reuse path: same clip stays loaded; a pending armed start is applied as a seek.
+    // A loop playlist's ClippingConfiguration is immutable, so a loop-REGION change needs a
+    // fresh playlist; an 'off'-region change is just a message re-arm and stays on the hot
+    // seek path. (Null armed values = generation unchanged = region unchanged.)
+    val loopRegionUnchanged = loopMode != "loop" ||
+      (
+        (armedClipStartSec?.let { kotlin.math.abs(it - installedLoopStartSec) < 0.001 } != false) &&
+          (armedClipEndSec?.let { kotlin.math.abs(it - installedLoopEndSec) < 0.001 } != false)
+        )
+    if (uri == currentUri && player != null && loopMode == installedLoopMode && loopRegionUnchanged) {
+      // Reuse path: same clip stays loaded; a pending armed start is applied as a seek and a
+      // pending armed end re-bounds the region. THE hot path for a baked-file segment swap.
       // (Guarded on the installed loop mode: a mode change needs a fresh playlist shape.)
       endedReported = false
+      frameGateClosed = false
+      val p = requireNotNull(player)
+      // Ordering matters twice here:
+      // 1. The armed end must land in `clipEndSec` BEFORE the seek — seek() clamps to the
+      //    region bound, and the new region lies entirely beyond the old one for a baked
+      //    follow-up (main [0, 15.04] → fu [28.71, 31.46]). Clamping against the STALE
+      //    bound seeked to the old main tail and played every intervening segment.
+      // 2. The end MESSAGE must be armed AFTER the seek: a PlayerMessage behind the current
+      //    playhead (e.g. re-arming the main region while parked at a later follow-up
+      //    segment) would deliver immediately and report a spurious end. seekTo updates the
+      //    masked position synchronously, so arming after it always places the bound ahead
+      //    of the playhead.
+      val armedEnd = armedClipEndSec
+      armedClipEndSec = null
+      if (armedEnd != null) clipEndSec = armedEnd
+      if (loopMode != "loop") offModeEndGateSec = clipEndSec
       armedClipStartSec?.let { start ->
         armedClipStartSec = null
         seek(start)
       }
-      val p = requireNotNull(player)
+      if (armedEnd != null && loopMode != "loop") armEndMessage(p, armedEnd)
       p.playWhenReady = shouldAutoPlay
       return
     }
 
     currentUri = uri
     endedReported = false
+    frameGateClosed = false
     delegate?.onStatusChange("loading")
 
     val generation = loadGeneration
@@ -179,15 +242,46 @@ class VideoSource(
           val p = ensurePlayer()
           val startSec = armedClipStartSec ?: 0.0
           armedClipStartSec = null
+          val endSec = armedClipEndSec ?: clipEndSec
+          armedClipEndSec = null
+          clipEndSec = endSec
+          offModeEndGateSec = if (loopMode == "loop") -1.0 else endSec
+          endMessage?.cancel()
+          endMessage = null
           val item = MediaItem.fromUri(uri)
           if (loopMode == "loop") {
             // Seamless loop: TWO identical items + REPEAT_MODE_ALL, not REPEAT_MODE_ONE.
             // ExoPlayer prewarms the next playlist period, so the item transition is
             // genuinely gapless; REPEAT_MODE_ONE resets the renderer at the wrap and can hitch.
-            // startSec applies to the FIRST cycle only: the loop must wrap to 0 because
-            // a pre-baked loop file's seam is frame(last)→frame(0).
-            p.setMediaItems(listOf(item, item), 0, (startSec * 1000).toLong())
+            if (endSec > 0) {
+              // Region loop: clip each playlist item to [startSec, endSec] so the prewarmed
+              // wrap lands on the region start. The bake guarantees an IDR exactly at the
+              // region start (startsAtKeyFrame skips the pre-roll decode). ExoPlayer reports
+              // CLIP-RELATIVE positions under clipping — clipOffsetSec translates back.
+              val clipped = MediaItem.Builder()
+                .setUri(uri)
+                .setClippingConfiguration(
+                  MediaItem.ClippingConfiguration.Builder()
+                    .setStartPositionMs((startSec * 1000).toLong())
+                    .setEndPositionMs((endSec * 1000).toLong())
+                    .setStartsAtKeyFrame(true)
+                    .build(),
+                )
+                .build()
+              clipOffsetSec = startSec
+              installedLoopStartSec = startSec
+              installedLoopEndSec = endSec
+              p.setMediaItems(listOf(clipped, clipped), 0, 0L)
+            } else {
+              // Whole-file loop: startSec applies to the FIRST cycle only — the loop must
+              // wrap to 0 because a pre-baked loop file's seam is frame(last)→frame(0).
+              clipOffsetSec = 0.0
+              installedLoopStartSec = 0.0
+              installedLoopEndSec = -1.0
+              p.setMediaItems(listOf(item, item), 0, (startSec * 1000).toLong())
+            }
           } else {
+            clipOffsetSec = 0.0
             p.setMediaItem(item, (startSec * 1000).toLong())
           }
           installedLoopMode = loopMode
@@ -195,6 +289,7 @@ class VideoSource(
           p.repeatMode = if (loopMode == "loop") Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
           p.playbackParameters = PlaybackParameters(desiredRate.toFloat())
           p.prepare()
+          if (loopMode != "loop") armEndMessage(p, endSec)
         } catch (_: Exception) {
           failPlayback()
         }
@@ -223,25 +318,53 @@ class VideoSource(
   fun seek(sec: Double) {
     val p = player ?: return
     endedReported = false
+    // Reopen eagerly: the first post-seek render self-corrects the gate anyway (see the
+    // frame metadata listener), but a paused player renders exactly one frame on seek —
+    // don't let a stale closed gate swallow it.
+    frameGateClosed = false
     if (loopMode == "loop") {
       // Target the CURRENT playlist item so a seek stays in this cycle instead of
-      // jumping back to item 0. `duration` is per-item under a playlist.
+      // jumping back to item 0. `duration` is per-item under a playlist, and under a
+      // region clip both it and the seek target are CLIP-RELATIVE — the caller's target
+      // is absolute file time, so translate by the clip offset.
+      val relSec = sec - clipOffsetSec
       val durationMs = p.duration
       val clampedSec = if (durationMs != C.TIME_UNSET) {
-        min(sec, durationMs / 1000.0 - 0.1)
+        min(relSec, durationMs / 1000.0 - 0.1)
       } else {
-        sec
+        relSec
       }
       p.seekTo(p.currentMediaItemIndex, (max(0.0, clampedSec) * 1000).toLong())
       return
     }
+    // 'off' mode plays the full item; clamp to the region bound when one is set so a seek
+    // cannot park the playhead beyond the reported end.
     val durationMs = p.duration
-    val clampedSec = if (durationMs != C.TIME_UNSET) {
-      min(sec, durationMs / 1000.0 - 0.1)
-    } else {
-      sec
-    }
+    var limitSec = if (durationMs != C.TIME_UNSET) durationMs / 1000.0 else Double.MAX_VALUE
+    if (clipEndSec > 0) limitSec = min(limitSec, clipEndSec)
+    val clampedSec = if (limitSec != Double.MAX_VALUE) min(sec, limitSec - 0.1) else sec
     p.seekTo((max(0.0, clampedSec) * 1000).toLong())
+  }
+
+  /// Exact end-of-region trigger for `'off'` mode: an ExoPlayer PlayerMessage delivered on
+  /// the main looper when playback reaches the bound — pause + report ended, the same
+  /// terminal shape STATE_ENDED produces at real file end. deleteAfterDelivery=false keeps
+  /// it armed across backwards seeks; it dies with the player or the next load.
+  private fun armEndMessage(p: ExoPlayer, endSec: Double) {
+    endMessage?.cancel()
+    endMessage = null
+    if (endSec <= 0) return
+    endMessage = p.createMessage { _, _ ->
+      if (player === p && !endedReported) {
+        endedReported = true
+        p.pause()
+        delegate?.onPlayToEnd()
+      }
+    }
+      .setPosition(0, (endSec * 1000).toLong())
+      .setLooper(Looper.getMainLooper())
+      .setDeleteAfterDelivery(false)
+      .send()
   }
 
   // MARK: - Lifecycle
@@ -299,8 +422,10 @@ class VideoSource(
     override fun run() {
       val p = player ?: return
       // `currentPosition` is per-item, so under the loop-mode two-item playlist it is
-      // already the 0→L sawtooth a loop should report.
-      val positionSec = p.currentPosition / 1000.0
+      // already the sawtooth a loop should report. Under a region clip it is additionally
+      // CLIP-RELATIVE; adding the clip offset keeps reported time (and therefore frame
+      // ptsSec stamps) in ABSOLUTE file seconds, per the contract.
+      val positionSec = p.currentPosition / 1000.0 + clipOffsetSec
       timeSnapshot = TimeSnapshot(
         positionSec,
         SystemClock.uptimeMillis(),
@@ -317,6 +442,16 @@ class VideoSource(
       .setLooper(Looper.getMainLooper())
       .build()
     p.setSeekParameters(SeekParameters.EXACT)
+    // Drives the 'off'-mode frame gate: fires on the playback thread just before EACH
+    // frame is released to the surface, with the frame's exact media timestamp (for the
+    // unclipped 'off'-mode item this is absolute file time; in loop mode the gate is -1
+    // and this is a no-op). Every frame sets the gate from ITS OWN pts, so the gate is
+    // self-correcting — a re-armed earlier region reopens it with the first legitimate
+    // frame's render, before that frame can reach the ImageReader.
+    p.setVideoFrameMetadataListener { presentationTimeUs, _, _, _ ->
+      val gate = offModeEndGateSec
+      frameGateClosed = gate > 0 && presentationTimeUs / 1_000_000.0 >= gate - 0.001
+    }
     // The host application owns audio focus.
     p.setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).build(), false)
     p.volume = volume.toFloat()
@@ -396,6 +531,14 @@ class VideoSource(
         postFrameFailure(reader)
         return
       } ?: return
+      // 'off'-mode region gate (see frameGateClosed): drop frames at/past the region bound
+      // (and anything after the end was reported); the renderer holds the last in-region
+      // frame — the cover clip swaps already rely on.
+      if (endedReported || frameGateClosed) {
+        image.close()
+        return
+      }
+      val stampSec = currentTime
       val hardwareBuffer = try {
         image.hardwareBuffer
       } catch (_: Exception) {
@@ -420,7 +563,7 @@ class VideoSource(
         val handle = FrameSourceNative.nativePushFrame(
           providerPtr,
           hardwareBuffer,
-          currentTime,
+          stampSec,
           clipGeneration,
         )
         check(handle != 0L)
@@ -507,6 +650,11 @@ class VideoSource(
 
   private fun teardown() {
     mainHandler.removeCallbacks(timeTicker)
+    endMessage?.cancel()
+    endMessage = null
+    clipOffsetSec = 0.0
+    offModeEndGateSec = -1.0
+    frameGateClosed = false
     player?.release()
     player = null
     currentUri = null

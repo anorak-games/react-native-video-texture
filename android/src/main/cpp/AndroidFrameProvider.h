@@ -30,7 +30,7 @@ class AndroidFrameProvider : public FrameProvider {
   // FrameProvider (worklet thread).
   AcquiredFrame copyNewFrame() override;
   TransportSnapshot transportSnapshot() override;
-  void loadClip(const std::string &uri, double startSec, int64_t generation,
+  void loadClip(const std::string &uri, double startSec, double endSec, int64_t generation,
                 const std::string &loopMode, bool autoPlay) override;
   void setPaused(bool paused) override;
   void setRate(double rate) override;

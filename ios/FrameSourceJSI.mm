@@ -38,10 +38,11 @@ public:
     snapshot.generation = value.generation;
     return snapshot;
   }
-  void loadClip(const std::string &uri, double startSec, int64_t generation,
+  void loadClip(const std::string &uri, double startSec, double endSec, int64_t generation,
                 const std::string &loopMode, bool autoPlay) override {
     [provider_ loadClipWithUri:[NSString stringWithUTF8String:uri.c_str()]
                       startSec:startSec
+                        endSec:endSec
                     generation:generation
                       loopMode:[NSString stringWithUTF8String:loopMode.c_str()]
                       autoPlay:autoPlay];

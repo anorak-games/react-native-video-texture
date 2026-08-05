@@ -34,9 +34,9 @@ class FrameSourceState {
     return provider_->transportSnapshot();
   }
 
-  void loadClip(const std::string &uri, double startSec, int64_t generation,
+  void loadClip(const std::string &uri, double startSec, double endSec, int64_t generation,
                 const std::string &loopMode, bool autoPlay) {
-    provider_->loadClip(uri, startSec, generation, loopMode, autoPlay);
+    provider_->loadClip(uri, startSec, endSec, generation, loopMode, autoPlay);
   }
 
   void setPaused(bool paused) { provider_->setPaused(paused); }
@@ -125,6 +125,7 @@ class FrameSourceHostObject : public jsi::HostObject {
             };
             auto autoPlayValue = options.getProperty(rt, "autoPlay");
             state->loadClip(uriValue.asString(rt).utf8(rt), number("startSec", 0.0),
+                            number("endSec", -1.0),
                             static_cast<int64_t>(number("generation", 0.0)),
                             string("loopMode", "off"),
                             autoPlayValue.isBool() ? autoPlayValue.getBool() : true);
