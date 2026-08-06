@@ -14,6 +14,11 @@ add_library(react-native-video-texture SHARED
 
 target_include_directories(react-native-video-texture PRIVATE ../cpp)
 
+target_link_options(react-native-video-texture PRIVATE
+  "-Wl,-z,max-page-size=16384"
+  "-Wl,-z,common-page-size=16384"
+)
+
 target_link_libraries(react-native-video-texture
   android
   log
