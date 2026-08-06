@@ -47,7 +47,7 @@ android {
 dependencies {
   implementation 'com.facebook.react:react-android'
 
-  def media3Version = "1.8.0"
+  def media3Version = "1.9.0"
   implementation "androidx.media3:media3-exoplayer:$media3Version"
   implementation "androidx.media3:media3-common:$media3Version"
   implementation "androidx.media3:media3-datasource:$media3Version"

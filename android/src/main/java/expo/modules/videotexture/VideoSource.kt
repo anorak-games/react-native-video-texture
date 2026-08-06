@@ -18,6 +18,7 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.PlayerMessage
 import androidx.media3.exoplayer.SeekParameters
@@ -438,8 +439,17 @@ class VideoSource(
 
   private fun ensurePlayer(): ExoPlayer {
     player?.let { return it }
+    val loadControl = DefaultLoadControl.Builder()
+      .setBufferDurationsMsForLocalPlayback(
+        LOCAL_MIN_BUFFER_MS,
+        LOCAL_MAX_BUFFER_MS,
+        LOCAL_BUFFER_FOR_PLAYBACK_MS,
+        LOCAL_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,
+      )
+      .build()
     val p = ExoPlayer.Builder(context)
       .setLooper(Looper.getMainLooper())
+      .setLoadControl(loadControl)
       .build()
     p.setSeekParameters(SeekParameters.CLOSEST_SYNC)
     // Drives the 'off'-mode frame gate: fires on the playback thread just before EACH
@@ -702,6 +712,10 @@ class VideoSource(
 
   companion object {
     private const val MAX_IMAGES = 5
+    private const val LOCAL_MIN_BUFFER_MS = 250
+    private const val LOCAL_MAX_BUFFER_MS = 1_000
+    private const val LOCAL_BUFFER_FOR_PLAYBACK_MS = 0
+    private const val LOCAL_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 0
     private const val TAG = "VideoTexture"
 
     /// ranchu/goldfish = the Android emulator (gfxstream graphics). Unsupported: gfxstream
