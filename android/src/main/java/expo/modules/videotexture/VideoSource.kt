@@ -441,7 +441,7 @@ class VideoSource(
     val p = ExoPlayer.Builder(context)
       .setLooper(Looper.getMainLooper())
       .build()
-    p.setSeekParameters(SeekParameters.EXACT)
+    p.setSeekParameters(SeekParameters.CLOSEST_SYNC)
     // Drives the 'off'-mode frame gate: fires on the playback thread just before EACH
     // frame is released to the surface, with the frame's exact media timestamp (for the
     // unclipped 'off'-mode item this is absolute file time; in loop mode the gate is -1
