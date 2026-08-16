@@ -245,3 +245,14 @@ index 917909e..c67ea00 100644
      _instance.SetLabel(_label.c_str());
    }
  
+diff --git a/node_modules/react-native-webgpu/react-native-webgpu.podspec b/node_modules/react-native-webgpu/react-native-webgpu.podspec
+index 12857ff..42d77d5 100644
+--- a/node_modules/react-native-webgpu/react-native-webgpu.podspec
++++ b/node_modules/react-native-webgpu/react-native-webgpu.podspec
+@@ -29,5 +29,5 @@ Pod::Spec.new do |s|
+   s.pod_target_xcconfig = {
+-    'HEADER_SEARCH_PATHS' => '$(PODS_TARGET_SRCROOT)/cpp',
++    'HEADER_SEARCH_PATHS' => '$(PODS_TARGET_SRCROOT)/cpp $(PODS_TARGET_SRCROOT)/cpp/jsi $(PODS_TARGET_SRCROOT)/cpp/rnwgpu $(PODS_TARGET_SRCROOT)/cpp/rnwgpu/api $(PODS_TARGET_SRCROOT)/cpp/rnwgpu/api/descriptors $(PODS_TARGET_SRCROOT)/cpp/rnwgpu/async $(PODS_TARGET_SRCROOT)/cpp/webgpu',
+     # Xcode's all-target headermaps let same-named headers leak across pods
+     # (e.g. @shopify/react-native-skia keeps a jsi/ helper layer with
+     # identical relative header paths). Resolve includes strictly through our
