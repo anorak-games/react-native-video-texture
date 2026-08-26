@@ -37,8 +37,8 @@ class VideoTexturePlayer(
   init {
     // ImageReader with usage flags (the AHardwareBuffer path) needs API 29.
     require(Build.VERSION.SDK_INT >= 29) { "VideoTexture requires Android API 29+" }
-    // The Android emulator cannot import decoded frames as WebGPU textures at all
-    // (see VideoSource.IS_EMULATOR); fail here rather than deep inside Dawn.
+    // Dawn cannot import any AHardwareBuffer under gfxstream (see VideoSource.IS_EMULATOR);
+    // fail here rather than 30 dropped frames deep in the caller's render loop.
     require(!VideoSource.IS_EMULATOR) {
       "VideoTexture is not supported on the Android emulator — use a physical device"
     }

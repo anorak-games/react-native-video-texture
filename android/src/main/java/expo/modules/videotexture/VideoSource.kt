@@ -718,10 +718,10 @@ class VideoSource(
     private const val LOCAL_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 0
     private const val TAG = "VideoTexture"
 
-    /// ranchu/goldfish = the Android emulator (gfxstream graphics). Unsupported: gfxstream
-    /// can neither Vulkan-import the codec's YUV gralloc buffers (tight NV12 allocation vs
-    /// padded host requirement) nor report a usable AHardwareBuffer allocationSize, so
-    /// Dawn's shared-texture-memory validation rejects every frame. Checked up front so the
+    /// ranchu/goldfish = the Android emulator (gfxstream graphics). Unsupported: gfxstream's
+    /// guest Vulkan exposes no external semaphore support, which Dawn's shared-texture-memory
+    /// BeginAccess requires, so importing any AHardwareBuffer fails — a freshly allocated
+    /// 64x64 RGBA buffer fails exactly like a 4K decoded frame. Checked up front so the
     /// failure is a clear message instead of a native validation error mid-render.
     val IS_EMULATOR: Boolean =
       android.os.Build.HARDWARE == "ranchu" || android.os.Build.HARDWARE == "goldfish"
