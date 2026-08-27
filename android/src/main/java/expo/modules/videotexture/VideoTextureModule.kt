@@ -2,8 +2,10 @@ package expo.modules.videotexture
 
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
+import androidx.media3.common.util.UnstableApi
 
 /// Android implementation of the VideoTexture Expo module.
+@UnstableApi
 class VideoTextureModule : Module() {
   companion object {
     init {
@@ -24,6 +26,16 @@ class VideoTextureModule : Module() {
 
     OnActivityEntersForeground {
       players.forEach { it.onForeground() }
+    }
+
+    AsyncFunction("queryVideoFormatSupport") { formats: List<VideoFormatQueryRecord> ->
+      formats.map { format ->
+        try {
+          VideoFormatSupportQuery.query(format)
+        } catch (caught: Exception) {
+          VideoFormatSupportQuery.platformError(caught)
+        }
+      }
     }
 
     Class(VideoTexturePlayer::class) {

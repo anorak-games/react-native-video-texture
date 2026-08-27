@@ -22,6 +22,41 @@ export type VideoLoopMode = 'off' | 'loop';
 
 export type VideoPixelFormat = 'bgra8' | 'nv12';
 
+export interface VideoFormatQuery {
+    codec: string;
+    width: number;
+    height: number;
+    fps: number;
+}
+
+export type VideoFormatQueryError =
+    | {
+          kind: 'invalid-candidate';
+          message: string;
+      }
+    | {
+          kind: 'platform-error';
+          message: string;
+      }
+    | {
+          kind: 'module-unavailable';
+          message: string;
+      };
+
+export interface VideoFormatSupport extends VideoFormatQuery {
+    supported: boolean;
+    hardwareAccelerated: boolean;
+    sustainedRate: boolean;
+    error: VideoFormatQueryError | null;
+}
+
+export interface NativeVideoFormatSupport {
+    supported: boolean;
+    hardwareAccelerated: boolean;
+    sustainedRate: boolean;
+    error: VideoFormatQueryError | null;
+}
+
 export interface LoadClipOptions {
     uri: string;
     /** Authoritative clip-start second, applied once per generation. */
@@ -114,6 +149,9 @@ export declare class VideoTexturePlayer extends SharedObject {
 /** Shape of the `VideoTexture` Expo module as exposed to JS. */
 export interface VideoTextureNativeModule {
     readonly VideoTexturePlayer: typeof VideoTexturePlayer;
+    queryVideoFormatSupport: (
+        formats: VideoFormatQuery[],
+    ) => Promise<NativeVideoFormatSupport[]>;
 }
 
 /**
@@ -125,4 +163,7 @@ export interface VideoTextureNativeModuleAccess {
     unavailableReason: string;
     getVideoTextureModule: () => VideoTextureNativeModule | null;
     isVideoTextureSupported: () => boolean;
+    queryNativeVideoFormatSupport: (
+        formats: VideoFormatQuery[],
+    ) => Promise<NativeVideoFormatSupport[]>;
 }

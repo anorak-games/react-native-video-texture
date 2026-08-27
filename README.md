@@ -85,6 +85,29 @@ import it with `device.importExternalTexture()`.
 Check `isVideoTextureSupported()` before entering a native video path. Importing the package
 is safe on web, but creating a player is not supported there.
 
+Query an ordered set of AVC or HEVC candidates before downloading a video:
+
+```ts
+import { queryVideoFormatSupport } from '@anorak-games/react-native-video-texture';
+
+const support = await queryVideoFormatSupport([
+  { codec: 'hvc1.1.6.L153', width: 3840, height: 2160, fps: 24 },
+  { codec: 'avc1.64002A', width: 1920, height: 1080, fps: 24 },
+]);
+```
+
+Results preserve input order. `supported: false` with no error is an ordinary device rejection.
+Malformed candidates and platform query failures carry an error on only that result, so callers can
+continue scanning later candidates. `hardwareAccelerated` identifies the selected native decoder;
+`sustainedRate` reports whether the platform says it can maintain the requested size and frame rate.
+Web reports every valid candidate as unsupported without an error.
+
+On iOS this query runs before an asset is downloaded, when only the codec string, dimensions, and
+frame rate are available. iOS exposes codec-family hardware availability at that point, but not a
+per-rendition performance query. Consequently `supported`, `hardwareAccelerated`, and
+`sustainedRate` all reflect codec-family hardware support there; `sustainedRate` assumes the
+candidate catalogue is constrained to the supported limits of the targeted iOS devices.
+
 ## Platform notes
 
 - Samples arrive as RGB on both platforms — Android converts decoder frames to RGBA8 on the

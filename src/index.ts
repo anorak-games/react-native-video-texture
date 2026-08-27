@@ -5,6 +5,7 @@
  * check `isVideoTextureSupported()` on paths that can run on web.
  */
 export { VIDEO_TEXTURE_DEVICE_FEATURES } from './deviceFeatures';
+export { queryVideoFormatSupport } from './formatSupport';
 export { isVideoTextureSupported } from './nativeModule';
 export { useVideoTexture, type VideoTexture } from './useVideoTexture';
 export { createVideoTexturePlayer, getFrameSource } from './VideoPlayer';
@@ -16,5 +17,8 @@ export type {
     VideoLoopMode,
     VideoPixelFormat,
     VideoPlayerStatus,
+    VideoFormatQuery,
+    VideoFormatQueryError,
+    VideoFormatSupport,
     VideoTexturePlayer,
 } from './types';

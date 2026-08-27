@@ -8,7 +8,12 @@
  * `requireOptionalNativeModule` below.
  */
 import { requireOptionalNativeModule } from 'expo-modules-core';
-import type { VideoTextureNativeModule, VideoTextureNativeModuleAccess } from './types';
+import type {
+    NativeVideoFormatSupport,
+    VideoFormatQuery,
+    VideoTextureNativeModule,
+    VideoTextureNativeModuleAccess,
+} from './types';
 
 /** Appended to the errors thrown by the module's entry points. */
 export const unavailableReason =
@@ -31,9 +36,42 @@ export function isVideoTextureSupported(): boolean {
     return getVideoTextureModule() !== null;
 }
 
+const failed = (
+    formats: VideoFormatQuery[],
+    kind: 'platform-error' | 'module-unavailable',
+    message: string,
+): NativeVideoFormatSupport[] =>
+    formats.map(() => ({
+        supported: false,
+        hardwareAccelerated: false,
+        sustainedRate: false,
+        error: { kind, message },
+    }));
+
+export async function queryNativeVideoFormatSupport(
+    formats: VideoFormatQuery[],
+): Promise<NativeVideoFormatSupport[]> {
+    const module = getVideoTextureModule();
+    if (!module) return failed(formats, 'module-unavailable', unavailableReason);
+
+    try {
+        const results = await module.queryVideoFormatSupport(formats);
+        if (results.length !== formats.length) {
+            throw new Error(
+                `native module returned ${results.length} results for ${formats.length} formats`,
+            );
+        }
+        return results;
+    } catch (caught: unknown) {
+        const message = caught instanceof Error ? caught.message : String(caught);
+        return failed(formats, 'platform-error', message);
+    }
+}
+
 /** Compile-time proof this variant still matches the seam contract. */
 export const ACCESS_CONTRACT: VideoTextureNativeModuleAccess = {
     unavailableReason,
     getVideoTextureModule,
     isVideoTextureSupported,
+    queryNativeVideoFormatSupport,
 };

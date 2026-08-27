@@ -17,7 +17,7 @@ Pod::Spec.new do |s|
   s.source_files   = 'ios/**/*.{h,m,mm,swift}', 'cpp/**/*.{h,cpp}'
   # C++-only headers must stay out of the ObjC module umbrella (jsi includes).
   s.private_header_files = 'cpp/**/*.h'
-  s.frameworks     = 'AVFoundation', 'CoreVideo'
+  s.frameworks     = 'AVFoundation', 'CoreVideo', 'VideoToolbox'
 
   # FrameSourceJSI.mm bridges frames to the WebGPU render worklet via the shared
   # cpp/FrameSourceHostObject (also compiled on Android).

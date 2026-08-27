@@ -4,6 +4,12 @@ public class VideoTextureModule: Module {
   public func definition() -> ModuleDefinition {
     Name("VideoTexture")
 
+    AsyncFunction("queryVideoFormatSupport") { (formats: [VideoFormatQueryRecord]) in
+      formats.map { format in
+        VideoFormatSupportQuery.query(format)
+      }
+    }
+
     // Headless player for the WebGPU consumer. Frames flow to the render
     // worklet through the JSI frame source installed under
     // globalThis.__videoTextureFrameSources[frameSourceKey].
